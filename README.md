@@ -93,7 +93,7 @@ All keys are read from `config.json` next to `index.js` (see
 | `logRequests` | `true` | Metadata log (model, tokens, cache hits, credit) |
 | `logBodies` | `false` | **Stores full conversation text in `logs/`** |
 | `logRetentionDays` | `7` | Auto-delete older logs |
-| `models` | 7 models | Exposed model ids |
+| `models` | 15 current models | Exposed model ids |
 
 ## Privacy
 

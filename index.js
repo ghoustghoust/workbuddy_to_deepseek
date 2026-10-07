@@ -45,7 +45,7 @@ const DEFAULTS = {
   clientVersion: '5.5.4', // WorkBuddy desktop version segment for UA
   cliVersion: '2.137.1', // CLI version segment for UA
   models: [
-    'deepseek-v3-2-volc', 'deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-v4.1-flash', 'glm-4.6', 'glm-4.6v', 'glm-4.7', 'glm-5.0', 'glm-5.0-turbo', 'glm-5.1', 'glm-5.2', 'glm-5.3', 'glm-5.3-flash', 'glm-5v-turbo', 'hunyuan-chat', 'hy3', 'hy3-x', 'hy4-preview', 'hy4-preview-x', 'kimi-k2-thinking', 'kimi-k2.5', 'kimi-k2.6', 'kimi-k2.7', 'kimi-k2.8-preview', 'kimi-k3-1', 'minimax-m2.5', 'minimax-m2.7', 'minimax-m3', 'space-bunny'
+    'hy4-preview', 'hy3', 'space-bunny', 'deepseek-v4.1-flash', 'glm-5.3', 'glm-5.3-flash', 'glm-5.2', 'glm-5.1', 'glm-5v-turbo', 'minimax-m3', 'kimi-k3-1', 'kimi-k2.8-preview', 'kimi-k2.7', 'kimi-k2.6', 'deepseek-v4-pro'
   ],
 }
 
@@ -272,6 +272,162 @@ function billingHeaders(a) {
 let pendingLogin = null // { state, startedAt }
 
 // ---------------------------------------------------------------------------
+// catalog + promotions: effective price per model (Asia/Shanghai windows)
+// ---------------------------------------------------------------------------
+
+const CATALOG_FILE = path.join(PLUGIN_DIR, 'catalog.json')
+const SH_OFFSET_MS = 8 * 3600_000 // Asia/Shanghai has no DST
+
+let catalog = { models: {}, promos: {}, fetchedAt: null }
+try { catalog = JSON.parse(fs.readFileSync(CATALOG_FILE, 'utf8')) } catch { /* first run */ }
+
+async function fetchCatalog() {
+  const a = loadAuth()
+  if (!a) return // pricing needs direct-mode credentials
+  const r = realm()
+  const host = new URL(r.chatBase).host
+  const headers = (ua) => ({
+    accept: 'application/json, text/plain, */*',
+    'x-requested-with': 'XMLHttpRequest',
+    authorization: `Bearer ${a.accessToken}`,
+    'x-user-id': a.uid ?? '',
+    'x-domain': host,
+    'x-product': 'SaaS',
+    'user-agent': ua,
+    'x-codebuddy-request': '1',
+    'accept-language': r.acceptLanguage,
+  })
+  const out = { models: { ...catalog.models }, promos: { ...catalog.promos }, fetchedAt: catalog.fetchedAt }
+  const sources = [
+    [`CLI/${CONFIG.cliVersion} CodeBuddy/${CONFIG.cliVersion}`, false],
+    ['CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0', true], // promotions ship with the IDE UA only
+  ]
+  for (const [ua, wantPromos] of sources) {
+    try {
+      const res = await fetch(`${r.chatBase}/v3/config`, { headers: headers(ua) })
+      const env = await res.json().catch(() => null)
+      const data = env?.data
+      if (!data) continue
+      for (const m of data.models ?? []) out.models[m.id] = m
+      if (wantPromos) {
+        out.promos = {}
+        for (const p of data.modelPromotions ?? []) {
+          if (!p.enabled) continue
+          for (const mid of p.modelIds ?? []) (out.promos[mid] ??= []).push(p)
+        }
+      }
+    } catch { /* keep previous catalog */ }
+  }
+  out.fetchedAt = new Date().toISOString()
+  catalog = out
+  try { fs.writeFileSync(CATALOG_FILE, JSON.stringify(out)) } catch { /* ignore */ }
+}
+
+function nowSH() { return new Date(Date.now() + SH_OFFSET_MS) } // read with UTC getters
+
+function inDailyWindow(dSH, daily) {
+  if (!daily?.length) return true
+  const minutes = dSH.getUTCHours() * 60 + dSH.getUTCMinutes()
+  return daily.some((w) => {
+    const [sh, sm] = String(w.start ?? '').split(':').map(Number)
+    const [eh, em] = String(w.end ?? '').split(':').map(Number)
+    if (Number.isNaN(sh) || Number.isNaN(eh)) return true
+    const s = sh * 60 + (sm || 0)
+    const e = eh * 60 + (em || 0)
+    // overnight window (e.g. 23:00 -> 7:50) wraps around midnight
+    return s <= e ? minutes >= s && minutes <= e : minutes >= s || minutes <= e
+  })
+}
+
+function parseMult(credits) {
+  const m = /x([\d.]+)/.exec(credits || '')
+  return m ? parseFloat(m[1]) : null
+}
+
+function promoActive(p) {
+  if (!p?.enabled) return false
+  const nowMs = Date.now()
+  if (p.schedule?.validFrom && nowMs < Date.parse(p.schedule.validFrom)) return false
+  if (p.schedule?.validUntil && nowMs > Date.parse(p.schedule.validUntil)) return false
+  return inDailyWindow(nowSH(), p.schedule?.daily)
+}
+
+function windowNote(p) {
+  const daily = p?.schedule?.daily ?? []
+  return daily.map((w) => `${w.start}-${w.end}`).join('/')
+}
+
+// effective multiplier for a model right now:
+//   { base, effective, free, label, note, exhausted }
+function effectivePrice(mid) {
+  const m = catalog.models[mid]
+  const base = parseMult(m?.credits)
+  if (!m || base === null) return null
+  const dSH = nowSH()
+  let best = null
+  for (const p of catalog.promos[mid] ?? []) {
+    if (!promoActive(p)) continue
+    if (!best || (p.priority ?? 0) > (best.priority ?? 0)) best = p
+  }
+  loadSpend()
+  const exhausted = freeExhausted[mid]
+  if (best?.discount && !exhausted) {
+    const f = best.discount.factor
+    const note = windowNote(best)
+    if (f === 0) return { base, effective: 0, free: true, label: best.badge?.label ?? '限时免费', note }
+    if (typeof f === 'number') {
+      return { base, effective: Math.round(base * f * 100) / 100, free: false, label: best.badge?.label ?? '', note }
+    }
+  }
+  // badge-only promo (no discount factor): price is unchanged; surface the
+  // vendor's own explanation (e.g. peak-hour surcharge windows)
+  const hover = best?.hover?.textZh ?? ''
+  return { base, effective: base, free: false, label: best?.badge?.label ?? '', note: hover || windowNote(best), exhausted: !!exhausted }
+}
+
+// pricing snapshot for panel/tool
+function pricingList() {
+  return Object.keys(catalog.models)
+    .filter((mid) => !/^(codewise-|nes-gf|hunyuan-image)/.test(mid) && !['default', 'auto'].includes(mid))
+    .map((mid) => {
+      const m = catalog.models[mid]
+      const ep = effectivePrice(mid)
+      return {
+        id: mid,
+        name: m.name || mid,
+        base: ep?.base ?? parseMult(m.credits),
+        effective: ep?.effective ?? null,
+        free: !!ep?.free,
+        label: ep?.label ?? '',
+        note: ep?.note ?? '',
+        exhausted: !!ep?.exhausted,
+      }
+    })
+    .filter((x) => x.base !== null)
+    .sort((a, b) => (a.effective ?? 9) - (b.effective ?? 9))
+}
+
+// free-quota exhaustion: a model whose promo price is 0 but that returned
+// credit > 0 has used up its daily free allowance — record for today.
+let freeExhausted = {}
+function loadFreeExhausted() {
+  loadSpend() // ensures spend.date is today
+  if (freeExhausted.__date !== spend.date) {
+    freeExhausted = { __date: spend.date }
+  }
+}
+
+function markFreeExhaustedIfNeeded(modelId, credit) {
+  if (!credit) return
+  const ep = effectivePrice(modelId)
+  if (ep?.free) {
+    loadFreeExhausted()
+    freeExhausted[modelId] = true
+    appendLog({ ts: new Date().toISOString(), event: 'free_quota_exhausted', model: modelId })
+  }
+}
+
+// ---------------------------------------------------------------------------
 // direct client: refresh + streaming chat + balance
 // ---------------------------------------------------------------------------
 
@@ -373,6 +529,7 @@ class DirectClient {
       reader.releaseLock().catch?.(() => {})
     }
     addSpend(usage.credit)
+    markFreeExhaustedIfNeeded(JSON.parse(payloadStr).model, usage.credit)
     appendLog({
       ts: new Date().toISOString(), event: 'request', mode: 'direct', ...logCtx,
       status: upstream.status, model: JSON.parse(payloadStr).model, durationMs: Date.now() - t0,
@@ -740,6 +897,7 @@ const LOGIN_PAGE_HTML = `<!doctype html>
   <button id="start">开始新登录（扫码）</button>
   <div id="msg" class="muted"></div>
 </div>
+<div class="card"><h1 style="font-size:16px;margin-top:0">实时价格（每小时自动更新）</h1><div id="pricing" class="muted">加载中…</div></div>
 <div class="card"><h1 style="font-size:16px;margin-top:0">已保存账号</h1><div id="accounts" class="muted">加载中…</div></div>
 <script>
 const $ = (id) => document.getElementById(id)
@@ -770,6 +928,30 @@ async function loadAccounts() {
       }      div.appendChild(b)
     }
     $('accounts').appendChild(div)
+  }
+}
+async function loadPricing() {
+  const d = await (await fetch('/pricing')).json()
+  const el = $('pricing')
+  el.innerHTML = ''
+  if (!d.models?.length) { el.textContent = '暂无数据（直连模式登录后自动获取）'; return }
+  for (const x of d.models) {
+    const row = document.createElement('div'); row.className = 'row'
+    const left = document.createElement('span'); left.textContent = x.name + ' [' + x.id + ']'
+    const right = document.createElement('span')
+    if (x.free && !x.exhausted) {
+      right.className = 'ok'; right.textContent = '现在免费' + (x.note ? '（' + x.note + '）' : '')
+    } else {
+      let t = 'x' + x.effective
+      if (x.effective !== x.base) t += ' · 原x' + x.base
+      if (x.label) t += ' · ' + x.label
+      if (x.note) t += '（' + x.note + '）'
+      if (x.exhausted) t += ' · 今日免费额度已用完'
+      right.textContent = t
+      if (x.effective < x.base) right.className = 'ok'
+    }
+    row.appendChild(left); row.appendChild(right)
+    el.appendChild(row)
   }
 }
 $('balbtn').onclick = async () => {
@@ -806,7 +988,8 @@ $('start').onclick = async () => {
     }, 3000)
   } catch (e) { $('msg').textContent = '失败：' + e; $('start').disabled = false }
 }
-loadStatus(); loadAccounts()
+loadStatus(); loadAccounts(); loadPricing()
+setInterval(loadPricing, 60_000)
 </script></body></html>`
 
 // ---------------------------------------------------------------------------
@@ -825,6 +1008,11 @@ export function apply(ctx) {
   // bundle installs; loose-directory installs fall back to the profile's
   // node_modules).
   registerTools(ctx).catch(() => { /* tools are optional */ })
+
+  // refresh the model catalog / promotions hourly and on startup
+  const catalogTimer = setInterval(() => { fetchCatalog().catch(() => {}) }, 3600_000)
+  catalogTimer.unref?.()
+  fetchCatalog().catch(() => {})
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -876,6 +1064,15 @@ export function apply(ctx) {
           current: a ? { uid: a.uid, nickname: a.nickname, expiresAt: a.expiresAt } : null,
           spendToday: Math.round((spend.credits ?? 0) * 1000) / 1000,
           dailyCreditBudget: CONFIG.dailyCreditBudget,
+        }))
+        return
+      }
+
+      if (req.method === 'GET' && url === '/pricing') {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({
+          fetchedAt: catalog.fetchedAt,
+          models: pricingList(),
         }))
         return
       }
@@ -1107,6 +1304,7 @@ export function apply(ctx) {
       const isSse = bodyText.includes('data: ')
       const { chunks, usage } = isSse ? parseSse(bodyText) : { chunks: [], usage: null }
       addSpend(usage?.credit ?? 0)
+      markFreeExhaustedIfNeeded(body.model, usage?.credit ?? 0)
 
       if (CONFIG.logRequests) {
         appendLog({
@@ -1165,6 +1363,7 @@ export function apply(ctx) {
     })
     return () => {
       server.close()
+      clearInterval(catalogTimer)
       wbipc.drop()
     }
   })
@@ -1195,8 +1394,8 @@ async function registerTools(ctx) {
       action: {
         type: 'string',
         required: true,
-        description: 'list | switch | balance | login',
-        enum: ['list', 'switch', 'balance', 'login'],
+        description: 'list | switch | balance | pricing | login',
+        enum: ['list', 'switch', 'balance', 'pricing', 'login'],
       },
       uid: { type: 'string', description: 'account uid (required for action=switch)' },
     },
@@ -1226,6 +1425,23 @@ async function registerTools(ctx) {
         } catch (e) {
           return `Balance query failed: ${e?.message ?? e}. If not logged in, open ${base}/login/page`
         }
+      }
+      if (args.action === 'pricing') {
+        const list = pricingList()
+        if (!list.length) return `No pricing data yet. It is fetched automatically (hourly) once direct mode is logged in.`
+        const fmt = (x) => {
+          if (x.free && !x.exhausted) return `现在免费${x.note ? `（${x.note}）` : ''}`
+          let t = `x${x.effective}`
+          const detail = [
+            ...(x.effective !== x.base ? [`原 x${x.base}`] : []),
+            ...(x.label ? [x.label] : []),
+            ...(x.note ? [x.note] : []),
+            ...(x.exhausted ? ['今日免费额度已用完'] : []),
+          ]
+          return detail.length ? `${t} (${detail.join(' · ')})` : t
+        }
+        const lines = list.map((x) => `- ${x.name} [${x.id}]: ${fmt(x)}`)
+        return `Current effective prices (Asia/Shanghai):\n${lines.join('\n')}`
       }
       if (args.action === 'login') {
         return `To add/switch accounts by WeChat QR scan, open the account panel in a browser: ${base}/login/page — then pick "开始新登录（扫码）". New logins take effect immediately without restarting.`

@@ -1,17 +1,8 @@
-# dsh-workbuddy-bridge bundle layer.
-# Applied when this bundle is listed in a profile. Users may override any of
-# these values from their own profile patch layer (same ids, applied later).
-#
-# 1) The bridge plugin: local OpenAI-compatible endpoint + WorkBuddy auth.
 - insert:
-    - id: workbuddy-bridge
-      name: dsh-workbuddy-bridge
-
-# 2) The LLM provider route. Every model points at the bridge's local
-#    endpoint; the bridge forwards to the WorkBuddy backend so billing stays
-#    on WorkBuddy credits (no external API keys involved).
+  - id: workbuddy-bridge
+    name: dsh-workbuddy-bridge
 - id: llm-pi-ai
-  name: "@deepseek-ai/dsh-llm-pi-ai"
+  name: '@deepseek-ai/dsh-llm-pi-ai'
   config:
     providers:
       workbuddy:
@@ -20,148 +11,108 @@
         api: openai-completions
         baseURL: http://127.0.0.1:37321/v1
         models:
-          - id: deepseek-v3-2-volc
-            name: DeepSeek-V3.2 (x0.29)
-            input: ["text"]
-            contextWindow: 96000
-            maxTokens: 32000
-          - id: deepseek-v4-flash
-            name: Deepseek-V4-Flash (x0.17) · 错峰使用 · 00:00-23:59
-            input: ["text", "image"]
-            contextWindow: 400000
-            maxTokens: 50000
-          - id: deepseek-v4-pro
-            name: Deepseek-V4-Pro (x0.51) · 错峰使用 · 00:00-23:59
-            input: ["text", "image"]
-            contextWindow: 400000
-            maxTokens: 131072
-          - id: deepseek-v4.1-flash
-            name: Deepseek-V4.1-Flash (x0.11)
-            input: ["text", "image"]
-            contextWindow: 400000
-            maxTokens: 131072
-          - id: glm-4.6
-            name: GLM-4.6 (x0.23)
-            input: ["text"]
-            contextWindow: 168000
-            maxTokens: 32000
-          - id: glm-4.6v
-            name: GLM-4.6V (x0.11)
-            input: ["text", "image"]
-            contextWindow: 128000
-            maxTokens: 32000
-          - id: glm-4.7
-            name: GLM-4.7 (x0.23)
-            input: ["text"]
-            contextWindow: 200000
-            maxTokens: 48000
-          - id: glm-5.0
-            name: GLM-5.0 (x0.80)
-            input: ["text"]
-            contextWindow: 200000
-            maxTokens: 48000
-          - id: glm-5.0-turbo
-            name: GLM-5.0-Turbo (x0.95)
-            input: ["text"]
-            contextWindow: 200000
-            maxTokens: 48000
-          - id: glm-5.1
-            name: GLM-5.1 (x0.79)
-            input: ["text", "image"]
-            contextWindow: 200000
-            maxTokens: 48000
-          - id: glm-5.2
-            name: GLM-5.2 (x0.79) · 夜间折扣 · 23:00-7:50
-            input: ["text", "image"]
-            contextWindow: 400000
-            maxTokens: 131072
-          - id: glm-5.3
-            name: GLM-5.3 (x0.79)
-            input: ["text", "image"]
-            contextWindow: 400000
-            maxTokens: 131072
-          - id: glm-5.3-flash
-            name: GLM-5.3-Flash (x0.06)
-            input: ["text", "image"]
-            contextWindow: 400000
-            maxTokens: 131072
-          - id: glm-5v-turbo
-            name: GLM-5v-Turbo (x0.71)
-            input: ["text", "image"]
-            contextWindow: 200000
-            maxTokens: 64000
-          - id: hunyuan-chat
-            name: Hunyuan-Turbos (x0.10)
-            input: ["text"]
-            contextWindow: 200000
-            maxTokens: 8192
-          - id: hy3
-            name: Hy3 (free) · 限时免费
-            input: ["text", "image"]
-            contextWindow: 192000
-            maxTokens: 64000
-          - id: hy3-x
-            name: Hy3-X (x0.05)
-            input: ["text", "image"]
-            contextWindow: 192000
-            maxTokens: 64000
-          - id: hy4-preview
-            name: Hy4 preview (x0.29) · 限时免费
-            input: ["text", "image"]
-            contextWindow: 400000
-            maxTokens: 64000
-          - id: hy4-preview-x
-            name: Hy4 preview-X (x0.29)
-            input: ["text", "image"]
-            contextWindow: 400000
-            maxTokens: 64000
-          - id: kimi-k2-thinking
-            name: Kimi-K2-Thinking (x0.54)
-            input: ["text"]
-            contextWindow: 164000
-            maxTokens: 32000
-          - id: kimi-k2.5
-            name: Kimi-K2.5 (x0.45)
-            input: ["text", "image"]
-            contextWindow: 164000
-            maxTokens: 32000
-          - id: kimi-k2.6
-            name: Kimi-K2.6 (x0.52)
-            input: ["text", "image"]
-            contextWindow: 256000
-            maxTokens: 32000
-          - id: kimi-k2.7
-            name: Kimi-K2.7-Code (x0.57)
-            input: ["text", "image"]
-            contextWindow: 256000
-            maxTokens: 32000
-          - id: kimi-k2.8-preview
-            name: Kimi-K2.8-Preview (x0.77)
-            input: ["text", "image"]
-            contextWindow: 400000
-            maxTokens: 131072
-          - id: kimi-k3-1
-            name: Kimi-K3 (x1.62)
-            input: ["text", "image"]
-            contextWindow: 400000
-            maxTokens: 131072
-          - id: minimax-m2.5
-            name: MiniMax-M2.5 (x0.18)
-            input: ["text"]
-            contextWindow: 200000
-            maxTokens: 48000
-          - id: minimax-m2.7
-            name: MiniMax-M2.7 (x0.19)
-            input: ["text", "image"]
-            contextWindow: 200000
-            maxTokens: 48000
-          - id: minimax-m3
-            name: MiniMax-M3 (x0.25)
-            input: ["text", "image"]
-            contextWindow: 400000
-            maxTokens: 131072
-          - id: space-bunny
-            name: Space-Bunny (x0.03) · 限时折扣
-            input: ["text", "image"]
-            contextWindow: 400000
-            maxTokens: 128000
+        - id: hy4-preview
+          name: Hy4 preview (x0.29·23:00-08:00免费)
+          input:
+          - text
+          - image
+          contextWindow: 400000
+          maxTokens: 64000
+        - id: hy3
+          name: Hy3 (现免费·至11-1)
+          input:
+          - text
+          - image
+          contextWindow: 192000
+          maxTokens: 64000
+        - id: space-bunny
+          name: Space-Bunny (x0.03·限时折扣·至10-8)
+          input:
+          - text
+          - image
+          contextWindow: 400000
+          maxTokens: 128000
+        - id: deepseek-v4.1-flash
+          name: Deepseek-V4.1-Flash (x0.11)
+          input:
+          - text
+          - image
+          contextWindow: 400000
+          maxTokens: 131072
+        - id: glm-5.3
+          name: GLM-5.3 (x0.79)
+          input:
+          - text
+          - image
+          contextWindow: 400000
+          maxTokens: 131072
+        - id: glm-5.3-flash
+          name: GLM-5.3-Flash (x0.06)
+          input:
+          - text
+          - image
+          contextWindow: 400000
+          maxTokens: 131072
+        - id: glm-5.2
+          name: GLM-5.2 (x0.79·夜间折扣)
+          input:
+          - text
+          - image
+          contextWindow: 400000
+          maxTokens: 131072
+        - id: glm-5.1
+          name: GLM-5.1 (x0.79)
+          input:
+          - text
+          - image
+          contextWindow: 200000
+          maxTokens: 48000
+        - id: glm-5v-turbo
+          name: GLM-5v-Turbo (x0.71)
+          input:
+          - text
+          - image
+          contextWindow: 200000
+          maxTokens: 64000
+        - id: minimax-m3
+          name: MiniMax-M3 (x0.25)
+          input:
+          - text
+          - image
+          contextWindow: 400000
+          maxTokens: 131072
+        - id: kimi-k3-1
+          name: Kimi-K3 (x1.62)
+          input:
+          - text
+          - image
+          contextWindow: 400000
+          maxTokens: 131072
+        - id: kimi-k2.8-preview
+          name: Kimi-K2.8-Preview (x0.77)
+          input:
+          - text
+          - image
+          contextWindow: 400000
+          maxTokens: 131072
+        - id: kimi-k2.7
+          name: Kimi-K2.7-Code (x0.57)
+          input:
+          - text
+          - image
+          contextWindow: 256000
+          maxTokens: 32000
+        - id: kimi-k2.6
+          name: Kimi-K2.6 (x0.52)
+          input:
+          - text
+          - image
+          contextWindow: 256000
+          maxTokens: 32000
+        - id: deepseek-v4-pro
+          name: Deepseek-V4-Pro (x0.51·错峰使用)
+          input:
+          - text
+          - image
+          contextWindow: 400000
+          maxTokens: 131072

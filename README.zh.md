@@ -72,7 +72,7 @@ dsh credentials set WORKBUDDY_PROXY_KEY <首启打印的 authToken>
 | `logRequests` | `true` | 元数据日志（模型、token、缓存命中、积分），不含正文 |
 | `logBodies` | `false` | **开启后完整对话正文落盘 `logs/`** |
 | `logRetentionDays` | `7` | 日志自动清理天数 |
-| `models` | 7 个模型 | 暴露的模型 id 列表 |
+| `models` | 15 个现役模型 | 暴露的模型 id 列表 |
 
 ## 上下文窗口说明
 
