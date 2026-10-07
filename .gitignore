@@ -1,0 +1,16 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+
+# NEVER commit credentials or personal data
+auth.json
+auths/
+state.json
+config.json
+logs/
+
+# Node
+node_modules/
+package-lock.json
+pnpm-lock.yaml

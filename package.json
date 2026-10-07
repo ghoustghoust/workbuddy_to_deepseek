@@ -1,0 +1,25 @@
+{
+  "name": "dsh-workbuddy-bridge",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness plugin: use WorkBuddy credit-billed models inside DSH with prompt-cache friendly context management. Dual transport (local IPC / direct connect), account switch panel, daily credit budget.",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "config.example.json"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "workbuddy",
+    "llm",
+    "proxy"
+  ],
+  "license": "SEE LICENSE IN LICENSE",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
