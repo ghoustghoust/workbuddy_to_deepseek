@@ -68,7 +68,8 @@ dsh credentials set WORKBUDDY_PROXY_KEY <首启打印的 authToken>
 | `realm` | `cn` | `cn`（copilot.tencent.com）/ `global`（workbuddy.ai） |
 | `port` | `37321` | 本地端点端口 |
 | `authToken` | 自动生成 | 共享密钥，需与 `WORKBUDDY_PROXY_KEY` 一致 |
-| `dailyCreditBudget` | `50` | 每日积分预算，`0` = 不限 |
+| `dailyCreditBudget` | `3000` | 每日积分预算，`0` = 不限 |
+| `perRequestCreditBudget` | `1000` | 单次请求预估积分上限（防 agent 循环失控），`0` = 关 |
 | `logRequests` | `true` | 元数据日志（模型、token、缓存命中、积分），不含正文 |
 | `logBodies` | `false` | **开启后完整对话正文落盘 `logs/`** |
 | `logRetentionDays` | `7` | 日志自动清理天数 |

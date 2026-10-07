@@ -91,7 +91,8 @@ All keys are read from `config.json` next to `index.js` (see
 | `realm` | `cn` | `cn` (copilot.tencent.com) or `global` (workbuddy.ai) |
 | `port` | `37321` | Local endpoint port |
 | `authToken` | auto-generated | Shared secret; must match `WORKBUDDY_PROXY_KEY` |
-| `dailyCreditBudget` | `50` | Daily credit spend limit, `0` = unlimited |
+| `dailyCreditBudget` | `3000` | Daily credit spend limit, `0` = unlimited |
+| `perRequestCreditBudget` | `1000` | Estimated single-request cap (runaway guard), `0` = off |
 | `logRequests` | `true` | Metadata log (model, tokens, cache hits, credit) |
 | `logBodies` | `false` | **Stores full conversation text in `logs/`** |
 | `logRetentionDays` | `7` | Auto-delete older logs |

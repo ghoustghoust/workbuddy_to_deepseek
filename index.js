@@ -38,7 +38,8 @@ const DEFAULTS = {
   realm: 'cn', // 'cn' | 'global'
   port: 37321,
   authToken: '', // empty = generated on first start and persisted here
-  dailyCreditBudget: 50, // credits/day, 0 = unlimited
+  dailyCreditBudget: 3000, // credits/day, 0 = unlimited
+  perRequestCreditBudget: 1000, // estimated single-request cap (runaway guard), 0 = off
   logRequests: true,
   logBodies: false, // WARNING: true stores full conversation text on disk
   logRetentionDays: 7,
@@ -538,7 +539,7 @@ class DirectClient {
       }
       res.end()
     } finally {
-      reader.releaseLock().catch?.(() => {})
+      try { reader.releaseLock() } catch { /* stream already released */ }
     }
     addSpend(usage.credit)
     markFreeExhaustedIfNeeded(JSON.parse(payloadStr).model, usage.credit)
@@ -1265,6 +1266,28 @@ export function apply(ctx) {
           },
         }))
         return
+      }
+
+      // per-request runaway guard: estimate this call's cost from payload
+      // size and the model's current effective multiplier
+      const perReq = CONFIG.perRequestCreditBudget
+      if (perReq > 0) {
+        const ep = effectivePrice(body.model)
+        if (ep && ep.effective != null) {
+          const estTokens = Math.ceil(logCtx.msgChars / 3)
+          const estCredits = Math.round(estTokens / 1000 * ep.effective * 10) / 10
+          if (estCredits > perReq) {
+            appendLog({ ts: new Date().toISOString(), event: 'per_request_blocked', model: body.model, estCredits, estTokens })
+            res.writeHead(429, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({
+              error: {
+                message: `estimated cost ~${estCredits} credits exceeds perRequestCreditBudget (${perReq})`,
+                hint: '上下文过大（疑似 agent 循环）。提高 config.json 的 perRequestCreditBudget（0 = 不限制）或缩短上下文',
+              },
+            }))
+            return
+          }
+        }
       }
 
       // ---- direct mode: real streaming passthrough ----
