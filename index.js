@@ -21,6 +21,7 @@ import * as http from 'http'
 import { fileURLToPath, pathToFileURL } from 'url'
 
 export const name = 'workbuddy-bridge'
+export const inject = ['tools']
 
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url))
 const LOG_DIR = path.join(PLUGIN_DIR, 'logs')
@@ -398,10 +399,11 @@ function effectivePrice(mid) {
   return { base, effective: base, free: false, label: best?.badge?.label ?? '', note: hover || windowNote(best), exhausted: !!exhausted }
 }
 
-// pricing snapshot for panel/tool
+// pricing snapshot for panel/tool — restricted to the models we actually expose
 function pricingList() {
+  const exposed = new Set(CONFIG.models)
   return Object.keys(catalog.models)
-    .filter((mid) => !/^(codewise-|nes-gf|hunyuan-image)/.test(mid) && !['default', 'auto'].includes(mid))
+    .filter((mid) => exposed.has(mid))
     .map((mid) => {
       const m = catalog.models[mid]
       const ep = effectivePrice(mid)
@@ -1076,7 +1078,7 @@ export function apply(ctx) {
         res.writeHead(200, { 'content-type': 'application/json' })
         let wbipcOk = false
         try { readEndpoint(); wbipcOk = true } catch { /* desktop app not running */ }
-        res.end(JSON.stringify({ plugin: name, ok: true, mode: CONFIG.mode, realm: CONFIG.realm, workbuddyIpc: wbipcOk }))
+        res.end(JSON.stringify({ plugin: name, ok: true, mode: CONFIG.mode, realm: CONFIG.realm, workbuddyIpc: wbipcOk, tool: toolStatus }))
         return
       }
 
@@ -1442,6 +1444,8 @@ export function apply(ctx) {
 // DSH tools (optional integration)
 // ---------------------------------------------------------------------------
 
+let toolStatus = { registered: false, reason: 'not-attempted' }
+
 async function registerTools(ctx) {
   let defineTool
   try {
@@ -1450,11 +1454,22 @@ async function registerTools(ctx) {
     // loose-directory install: fall back to the profile's node_modules
     try {
       ({ defineTool } = await import(pathToFileURL(path.join(os.homedir(), '.dsh', 'profiles', 'node_modules', '@deepseek-ai', 'dsh-tools', 'lib', 'index.js')).href))
-    } catch {
-      return // tools are an optional integration
+    } catch (e) {
+      toolStatus = { registered: false, reason: `dsh-tools import failed: ${e?.message ?? e}` }
+      appendLog({ ts: new Date().toISOString(), event: 'tools_failed', reason: toolStatus.reason })
+      return
     }
   }
-  if (typeof defineTool !== 'function' || !ctx?.tools) return
+  if (typeof defineTool !== 'function') {
+    toolStatus = { registered: false, reason: 'defineTool is not a function' }
+    appendLog({ ts: new Date().toISOString(), event: 'tools_failed', reason: toolStatus.reason })
+    return
+  }
+  if (!ctx?.tools || typeof ctx.tools.register !== 'function') {
+    toolStatus = { registered: false, reason: `ctx.tools unavailable (typeof=${typeof ctx?.tools}, hasRegister=${typeof ctx?.tools?.register})` }
+    appendLog({ ts: new Date().toISOString(), event: 'tools_failed', reason: toolStatus.reason })
+    return
+  }
 
   ctx.tools.register(defineTool({
     name: 'workbuddy_account',
@@ -1469,7 +1484,10 @@ async function registerTools(ctx) {
       uid: { type: 'string', description: 'account uid (required for action=switch)' },
       mode: { type: 'string', description: 'transport mode (required for action=mode): wbipc | direct' },
     },
-    output: { schema: { type: 'string' } },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: String(value) }],
+    },
     async execute(args) {
       const base = `http://127.0.0.1:${CONFIG.port}`
       if (args.action === 'list') {
@@ -1532,4 +1550,6 @@ async function registerTools(ctx) {
       return `Unknown action: ${args.action}`
     },
   }))
+  toolStatus = { registered: true, reason: 'ok' }
+  appendLog({ ts: new Date().toISOString(), event: 'tools_registered', tool: 'workbuddy_account' })
 }
