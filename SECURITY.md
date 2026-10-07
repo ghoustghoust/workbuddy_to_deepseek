@@ -16,6 +16,15 @@
 | 积分失控（agent 循环、重试风暴） | `dailyCreditBudget` 每日护栏，超限返回 429；直连模式客户端断开会向上游 abort，提前止损 |
 | 依赖供应链 | 运行时零第三方依赖（仅 Node 内置模块）；`@deepseek-ai/dsh-tools` 为可选集成，缺失时自动降级 |
 
+## DSH 内嵌面板的路由（`/workbuddy/*`）
+
+安装成 bundle 后，面板通过 DSH 自带的 web 服务器与我们通信（避免跨源）。由于该服务器在「公网部署」场景下可能不止监听回环地址，路由的鉴权模型是：
+
+- 除 `/workbuddy/bootstrap` 外，全部要求 `Authorization: Bearer <authToken>`
+- `/workbuddy/bootstrap` 只把 token 交给 `Sec-Fetch-Site: same-origin` 的页面（浏览器无法伪造该头，跨站页面拿到的是 `cross-site` → 403）
+- 任何响应都不返回 accessToken / refreshToken，只返回昵称、uid、到期时间、价格与消耗计数
+- 这些路由只做「切号 / 切模式 / 发起扫码 / 查价」，不代发模型请求，因此不具备烧积分的能力（烧积分仍需 37321 上的 LLM 端点，那边强制 Bearer + 仅回环）
+
 ## 已知限制（诚实清单）
 
 - **token 明文落盘**：直连模式的 refreshToken 是账号长期凭证，以明文存于 `auth.json`（权限 0600）。Windows 下可用 DPAPI 加密——列为 roadmap，当前版本依赖文件权限与用户自觉。对凭证敏感的用户请用 wbipc 模式（零落盘）

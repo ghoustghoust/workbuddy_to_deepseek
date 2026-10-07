@@ -23,12 +23,18 @@ import { fileURLToPath, pathToFileURL } from 'url'
 export const name = 'workbuddy-bridge'
 export const inject = ['tools']
 
-const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url))
-const LOG_DIR = path.join(PLUGIN_DIR, 'logs')
-const AUTH_FILE = path.join(PLUGIN_DIR, 'auth.json')
-const AUTHS_DIR = path.join(PLUGIN_DIR, 'auths')
-const STATE_FILE = path.join(PLUGIN_DIR, 'state.json')
-const CONFIG_FILE = path.join(PLUGIN_DIR, 'config.json')
+// Data lives in a stable location independent of where this package is
+// installed (loose plugin dir vs profile node_modules), so credentials and
+// logs survive an upgrade from the manual install to the bundle install.
+const DATA_DIR = path.join(os.homedir(), '.dsh', 'plugins', 'workbuddy-proxy')
+const LOG_DIR = path.join(DATA_DIR, 'logs')
+const AUTH_FILE = path.join(DATA_DIR, 'auth.json')
+const AUTHS_DIR = path.join(DATA_DIR, 'auths')
+const STATE_FILE = path.join(DATA_DIR, 'state.json')
+const CONFIG_FILE = path.join(DATA_DIR, 'config.json')
+const CATALOG_FILE = path.join(DATA_DIR, 'catalog.json')
+
+try { fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 }) } catch { /* exists */ }
 
 // ---------------------------------------------------------------------------
 // config
@@ -289,7 +295,6 @@ let pendingLogin = null // { state, startedAt }
 // catalog + promotions: effective price per model (Asia/Shanghai windows)
 // ---------------------------------------------------------------------------
 
-const CATALOG_FILE = path.join(PLUGIN_DIR, 'catalog.json')
 const SH_OFFSET_MS = 8 * 3600_000 // Asia/Shanghai has no DST
 
 let catalog = { models: {}, promos: {}, fetchedAt: null }
@@ -1019,6 +1024,159 @@ setInterval(loadPricing, 60_000)
 </script></body></html>`
 
 // ---------------------------------------------------------------------------
+// DSH web-server surface (`/workbuddy/*`)
+//
+// The in-DSH settings panel (client half) talks to us over DSH's own web
+// server so there is no cross-origin call to 127.0.0.1:<port>. Because that
+// server may be reachable beyond loopback (public deployments), every route
+// requires the shared bearer token; the only unauthenticated route is
+// /workbuddy/bootstrap, which hands the token to a browser page that proves
+// it is same-origin via Sec-Fetch-Site (a web page cannot forge that header).
+// ---------------------------------------------------------------------------
+
+const WEB_PREFIX = '/workbuddy'
+
+const direct = new DirectClient()
+
+function sendJson(res, status, obj) {
+  const buf = Buffer.from(JSON.stringify(obj), 'utf8')
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': buf.length })
+  res.end(buf)
+}
+
+function webSummary() {
+  const a = loadAuth()
+  loadSpend()
+  let wbipcOk = false
+  try { readEndpoint(); wbipcOk = true } catch { /* desktop not running */ }
+  return {
+    mode: CONFIG.mode,
+    realm: CONFIG.realm,
+    port: CONFIG.port,
+    workbuddyIpc: wbipcOk,
+    tool: toolStatus,
+    account: a ? { uid: a.uid, nickname: a.nickname, expiresAt: a.expiresAt } : null,
+    accounts: listAuths(),
+    spendToday: Math.round((spend.credits ?? 0) * 1000) / 1000,
+    dailyCreditBudget: CONFIG.dailyCreditBudget,
+    perRequestCreditBudget: CONFIG.perRequestCreditBudget,
+    catalogFetchedAt: catalog.fetchedAt,
+    pricing: pricingList(),
+  }
+}
+
+async function webHandler(req, res) {
+  const url = (req.url ?? '').split('?')[0]
+  const sub = url.slice(WEB_PREFIX.length) || '/'
+  try {
+    // token bootstrap: only for a genuinely same-origin browser page
+    if (req.method === 'GET' && sub === '/bootstrap') {
+      if (req.headers['sec-fetch-site'] !== 'same-origin') {
+        sendJson(res, 403, { error: { message: 'same-origin only' } })
+        return
+      }
+      sendJson(res, 200, { token: CONFIG.authToken })
+      return
+    }
+    const auth = req.headers.authorization ?? ''
+    if (auth !== `Bearer ${CONFIG.authToken}`) {
+      sendJson(res, 401, { error: { message: 'unauthorized' } })
+      return
+    }
+
+    if (req.method === 'GET' && (sub === '/summary' || sub === '/')) {
+      sendJson(res, 200, webSummary())
+      return
+    }
+    if (req.method === 'GET' && sub === '/pricing') {
+      sendJson(res, 200, { fetchedAt: catalog.fetchedAt, models: pricingList() })
+      return
+    }
+    if (req.method === 'GET' && sub === '/balance') {
+      sendJson(res, 200, await direct.balance())
+      return
+    }
+    if (req.method === 'POST' && sub === '/mode') {
+      const body = await readRequestBody(req)
+      const mode = String(body.mode ?? '')
+      if (mode !== 'wbipc' && mode !== 'direct') { sendJson(res, 400, { error: { message: 'mode must be wbipc or direct' } }); return }
+      const warnings = []
+      if (mode === 'direct' && !loadAuth()) warnings.push('direct 模式尚未登录，请先扫码')
+      if (mode === 'wbipc') {
+        try { readEndpoint() } catch { warnings.push('WorkBuddy 桌面端未运行，wbipc 请求会失败') }
+        warnings.push('wbipc 通道有 768KB 请求 / 640KB 响应上限')
+      }
+      setMode(mode)
+      sendJson(res, 200, { ok: true, mode, warnings })
+      return
+    }
+    if (req.method === 'POST' && sub === '/accounts/switch') {
+      const body = await readRequestBody(req)
+      const a = switchAuth(String(body.uid ?? ''))
+      if (!a) { sendJson(res, 404, { error: { message: 'no such saved account' } }); return }
+      appendLog({ ts: new Date().toISOString(), event: 'account_switch', uid: a.uid, nickname: a.nickname })
+      sendJson(res, 200, { ok: true, uid: a.uid, nickname: a.nickname })
+      return
+    }
+    if (req.method === 'POST' && sub === '/login') {
+      const r = await fetch(`${realm().chatBase}/v2/plugin/auth/state?platform=CLI`, { method: 'POST', headers: loginHeaders(), body: '{}' })
+      const env = await r.json().catch(() => null)
+      if (!env?.data?.state || !env?.data?.authUrl) { sendJson(res, 502, { error: { message: `auth/state failed: HTTP ${r.status}` } }); return }
+      pendingLogin = { state: env.data.state, startedAt: Date.now() }
+      sendJson(res, 200, { state: env.data.state, authUrl: env.data.authUrl })
+      return
+    }
+    if (req.method === 'GET' && sub === '/login/poll') {
+      if (!pendingLogin || Date.now() - pendingLogin.startedAt > 10 * 60 * 1000) {
+        sendJson(res, 400, { error: { message: 'no pending login' } })
+        return
+      }
+      const r = await fetch(`${realm().chatBase}/v2/plugin/auth/token?state=${pendingLogin.state}`, { headers: loginHeaders() })
+      const env = await r.json().catch(() => null)
+      const tok = env?.data
+      if (!env || env.code !== 0 || !tok?.accessToken) { sendJson(res, 200, { status: 'pending' }); return }
+      const a = {
+        accessToken: tok.accessToken,
+        refreshToken: tok.refreshToken ?? '',
+        expiresAt: tok.expiresIn ? Date.now() + tok.expiresIn * 1000 : 0,
+        domain: tok.domain,
+      }
+      try {
+        const ar = await fetch(`${realm().chatBase}/v2/plugin/login/account?state=${pendingLogin.state}`, {
+          headers: { ...loginHeaders(), authorization: `Bearer ${a.accessToken}` },
+        })
+        const aenv = await ar.json().catch(() => null)
+        if (aenv?.data?.uid) { a.uid = aenv.data.uid; a.enterpriseId = aenv.data.enterpriseId || undefined; a.nickname = aenv.data.nickname }
+      } catch { /* optional */ }
+      saveAuth(a)
+      pendingLogin = null
+      appendLog({ ts: new Date().toISOString(), event: 'login', uid: a.uid, nickname: a.nickname })
+      sendJson(res, 200, { status: 'ok', uid: a.uid, nickname: a.nickname })
+      return
+    }
+    sendJson(res, 404, { error: { message: `no route: ${req.method} ${url}` } })
+  } catch (e) {
+    try { sendJson(res, 500, { error: { message: String(e?.message ?? e) } }) } catch { /* socket gone */ }
+  }
+}
+
+function readRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    let size = 0
+    req.on('data', (c) => {
+      size += c.length
+      if (size > 1024 * 1024) { reject(new Error('body too large')); req.destroy(); return }
+      chunks.push(c)
+    })
+    req.on('end', () => {
+      try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}) } catch { resolve({}) }
+    })
+    req.on('error', reject)
+  })
+}
+
+// ---------------------------------------------------------------------------
 // plugin entry
 // ---------------------------------------------------------------------------
 
@@ -1027,7 +1185,6 @@ export function apply(ctx) {
   loadSpend()
 
   const wbipc = new WbipcClient()
-  const direct = new DirectClient()
 
   // DSH tool integration: lets the agent answer "切换账号 / 查余额" in chat.
   // Registered only when the dsh-tools package is resolvable (always true for
@@ -1421,6 +1578,14 @@ export function apply(ctx) {
   server.on('clientError', (_err, socket) => { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n') })
   server.requestTimeout = 0
   server.headersTimeout = 60_000
+
+  ctx.inject?.(['webServer'], (scope) => {
+    scope.effect(() => scope.webServer.register({
+      kind: 'prefix',
+      path: WEB_PREFIX,
+      handler: webHandler,
+    }), 'workbuddy-bridge: /workbuddy 路由')
+  })
 
   ctx.effect(() => {
     server.listen(CONFIG.port, '127.0.0.1', () => {

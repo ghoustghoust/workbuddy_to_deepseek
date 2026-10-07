@@ -32,11 +32,15 @@ third-party API.
   caps, works without the desktop app). Switch at runtime from the panel,
   via `POST /config/mode`, or by asking the agent ("切到 direct 模式") —
   no restart needed.
-- **Account panel** — `http://127.0.0.1:37321/login/page`: WeChat QR login,
-  multi-account archive, one-click switching (effective immediately, no
-  restart), credit balance.
-- **DSH tool** — a `workbuddy_account` tool the agent can call to list /
-  switch accounts or check balance ("切换到 xxx 账号", "查一下积分").
+- **In-DSH settings panel** — once installed as a bundle, DSH's Settings
+  gains a **WorkBuddy 桥接** section: current account and credential expiry,
+  credit balance, WeChat QR login / add account, saved-account switching,
+  runtime transport toggle, today's spend vs budget, and the live price
+  table. A browser fallback panel is also served at
+  `http://127.0.0.1:37321/login/page` (useful before the bundle install).
+- **DSH tool** — `workbuddy_account`, callable by the agent to list / switch
+  accounts, check balance, read live prices or switch transport ("切到 direct
+  模式", "查下积分"). Verified end-to-end in a live session.
 - **Daily credit budget** — refuse requests once the configured daily spend
   is reached (`dailyCreditBudget`, 0 = unlimited).
 - **Local-only by design** — the endpoint binds to `127.0.0.1`, rejects

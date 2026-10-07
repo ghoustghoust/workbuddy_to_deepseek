@@ -1,11 +1,25 @@
 {
   "name": "dsh-workbuddy-bridge",
-  "version": "1.0.0",
-  "description": "DeepSeek Harness plugin: use WorkBuddy credit-billed models inside DSH with prompt-cache friendly context management. Dual transport (local IPC / direct connect), account switch panel, daily credit budget.",
+  "version": "1.1.0",
+  "description": "DeepSeek Harness plugin: use WorkBuddy credit-billed models inside DSH. Dual transport (desktop-forwarded IPC / direct OAuth device flow), real streaming, in-DSH settings panel for account switching and live pricing, daily credit budget.",
   "type": "module",
   "main": "index.js",
+  "engines": {
+    "node": ">=24"
+  },
+  "exports": {
+    ".": {
+      "default": "./index.js"
+    },
+    "./client": {
+      "default": "./client.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
   "files": [
     "index.js",
+    "client.js",
     "cordis.patch.yml",
     "config.example.json"
   ],
@@ -20,6 +34,29 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "pluginCenter": {
+      "expectedEntries": [
+        "dsh-workbuddy-bridge"
+      ],
+      "expectedClientModules": [
+        "dsh-workbuddy-bridge"
+      ],
+      "expectedSkillIds": [],
+      "ownedData": [
+        {
+          "path": "workbuddy-proxy",
+          "label": "WorkBuddy 登录凭证与用量日志"
+        }
+      ]
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-layout"
+      ]
     }
   }
 }
