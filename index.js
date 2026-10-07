@@ -18,7 +18,7 @@ import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
 import * as http from 'http'
-import { fileURLToPath } from 'url'
+import { fileURLToPath, pathToFileURL } from 'url'
 
 export const name = 'workbuddy-bridge'
 
@@ -64,6 +64,18 @@ function loadConfig() {
 }
 
 const CONFIG = loadConfig()
+
+function setMode(mode) {
+  if (mode !== 'wbipc' && mode !== 'direct') return false
+  CONFIG.mode = mode
+  try {
+    const disk = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'))
+    disk.mode = mode
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(disk, null, 2), { mode: 0o600 })
+  } catch { /* in-memory switch still applies */ }
+  appendLog({ ts: new Date().toISOString(), event: 'mode_switch', mode })
+  return true
+}
 
 const REALMS = {
   cn: {
@@ -886,12 +898,14 @@ const LOGIN_PAGE_HTML = `<!doctype html>
   .row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #2a2a2a;gap:8px}
   .row:last-child{border-bottom:0}
   .muted{color:#888;font-size:13px} .ok{color:#4cd964} .cur{color:#2f6fed;font-weight:600}
+  .mode-btn.active{background:#2f6fed}
   a{color:#7fb0ff;word-break:break-all}
   #msg{margin-top:10px;min-height:22px}
 </style></head><body>
 <h1>WorkBuddy Bridge · 扫码切号 / 余额</h1>
 <div class="card">
   <div class="row"><span>当前账号</span><span id="cur" class="muted">…</span></div>
+  <div class="row"><span>传输模式</span><span><button class="ghost mode-btn" id="m-wbipc" data-mode="wbipc">wbipc（桌面端代持）</button> <button class="ghost mode-btn" id="m-direct" data-mode="direct">direct（直连流式）</button></span></div>
   <div class="row"><span>今日已耗积分</span><span id="spend" class="muted">…</span></div>
   <div class="row"><span>账户余额</span><span id="bal" class="muted">…</span> <button class="ghost" id="balbtn">查询</button></div>
   <button id="start">开始新登录（扫码）</button>
@@ -905,6 +919,15 @@ async function loadStatus() {
   const d = await (await fetch('/status')).json()
   $('cur').textContent = d.current ? (d.current.nickname || d.current.uid.slice(0, 8)) : '未登录'
   $('spend').textContent = d.spendToday + ' / ' + (d.dailyCreditBudget > 0 ? d.dailyCreditBudget : '∞')
+  for (const b of document.querySelectorAll('.mode-btn')) b.classList.toggle('active', b.dataset.mode === d.mode)
+}
+for (const b of document.querySelectorAll('.mode-btn')) {
+  b.onclick = async () => {
+    const r = await fetch('/config/mode', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: b.dataset.mode }) })
+    const d = await r.json()
+    $('msg').textContent = d.ok ? ('已切换到 ' + d.mode + (d.warnings?.length ? '：' + d.warnings.join('；') : '')) : (d.error?.message || '切换失败')
+    loadStatus()
+  }
 }
 async function loadAccounts() {
   const d = await (await fetch('/auth')).json()
@@ -1029,15 +1052,15 @@ export function apply(ctx) {
       // 2. Browser cross-site requests are rejected: a malicious web page
       //    must not be able to spend credits by POSTing to localhost.
       const site = req.headers['sec-fetch-site']
-      const sameOriginPage = site === 'same-origin' || site === 'none'
-      if (site !== undefined && !sameOriginPage) {
+      if (site !== undefined && site !== 'same-origin' && site !== 'none') {
         res.writeHead(403, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ error: { message: 'cross-site requests are not allowed' } }))
         return
       }
-      // 3. Non-page endpoints require the shared token, except same-origin
-      //    panel fetches (a web page cannot forge same-origin).
-      const needsAuth = url !== '/health' && url !== '/login/page' && !sameOriginPage
+      // 3. All data endpoints require the shared token. Exemptions: /health
+      //    (no secrets) and the static panel page. The panel's own fetches
+      //    carry Sec-Fetch-Site: same-origin, which a web page cannot forge.
+      const needsAuth = url !== '/health' && url !== '/login/page' && site !== 'same-origin'
       if (needsAuth) {
         const auth = req.headers.authorization ?? ''
         if (auth !== `Bearer ${CONFIG.authToken}`) {
@@ -1061,6 +1084,8 @@ export function apply(ctx) {
         const a = loadAuth()
         loadSpend()
         res.end(JSON.stringify({
+          mode: CONFIG.mode,
+          realm: CONFIG.realm,
           current: a ? { uid: a.uid, nickname: a.nickname, expiresAt: a.expiresAt } : null,
           spendToday: Math.round((spend.credits ?? 0) * 1000) / 1000,
           dailyCreditBudget: CONFIG.dailyCreditBudget,
@@ -1170,6 +1195,27 @@ export function apply(ctx) {
         appendLog({ ts: new Date().toISOString(), event: 'account_switch', uid: a.uid, nickname: a.nickname })
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ ok: true, uid: a.uid, nickname: a.nickname }))
+        return
+      }
+
+      if (req.method === 'POST' && url === '/config/mode') {
+        const body = await readBody(req)
+        let mode = ''
+        try { mode = String(JSON.parse(body.toString('utf8')).mode ?? '') } catch { /* invalid */ }
+        if (mode !== 'wbipc' && mode !== 'direct') {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: { message: 'mode must be "wbipc" or "direct"' } }))
+          return
+        }
+        const warnings = []
+        if (mode === 'direct' && !loadAuth()) warnings.push('direct mode not logged in yet — use the panel QR login')
+        if (mode === 'wbipc') {
+          try { readEndpoint() } catch { warnings.push('WorkBuddy desktop app is not running — wbipc requests will fail with 502') }
+          warnings.push('wbipc transport caps: ~768 KB request / 640 KB response; large contextWindow models may return 413')
+        }
+        setMode(mode)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, mode, warnings }))
         return
       }
 
@@ -1380,7 +1426,7 @@ async function registerTools(ctx) {
   } catch {
     // loose-directory install: fall back to the profile's node_modules
     try {
-      ({ defineTool } = await import(path.join(os.homedir(), '.dsh', 'profiles', 'node_modules', '@deepseek-ai', 'dsh-tools', 'lib', 'index.js')))
+      ({ defineTool } = await import(pathToFileURL(path.join(os.homedir(), '.dsh', 'profiles', 'node_modules', '@deepseek-ai', 'dsh-tools', 'lib', 'index.js')).href))
     } catch {
       return // tools are an optional integration
     }
@@ -1394,10 +1440,11 @@ async function registerTools(ctx) {
       action: {
         type: 'string',
         required: true,
-        description: 'list | switch | balance | pricing | login',
-        enum: ['list', 'switch', 'balance', 'pricing', 'login'],
+        description: 'list | switch | balance | pricing | mode | login',
+        enum: ['list', 'switch', 'balance', 'pricing', 'mode', 'login'],
       },
       uid: { type: 'string', description: 'account uid (required for action=switch)' },
+      mode: { type: 'string', description: 'transport mode (required for action=mode): wbipc | direct' },
     },
     output: { schema: { type: 'string' } },
     async execute(args) {
@@ -1442,6 +1489,19 @@ async function registerTools(ctx) {
         }
         const lines = list.map((x) => `- ${x.name} [${x.id}]: ${fmt(x)}`)
         return `Current effective prices (Asia/Shanghai):\n${lines.join('\n')}`
+      }
+      if (args.action === 'mode') {
+        const want = args.mode
+        if (!want) return `Current transport mode: ${CONFIG.mode}. Pass mode="wbipc" or mode="direct" to switch.`
+        if (want !== 'wbipc' && want !== 'direct') return `Unknown mode ${want}; expected wbipc or direct.`
+        const notes = []
+        if (want === 'direct' && !loadAuth()) notes.push('尚未登录，需打开面板扫码')
+        if (want === 'wbipc') {
+          try { readEndpoint() } catch { notes.push('WorkBuddy 桌面端未运行，切过去会 502') }
+          notes.push('wbipc 有 768KB 请求 / 640KB 响应上限')
+        }
+        setMode(want)
+        return `已切换到 ${want} 模式${notes.length ? '（' + notes.join('；') + '）' : ''}，下一个请求即生效，无需重启。`
       }
       if (args.action === 'login') {
         return `To add/switch accounts by WeChat QR scan, open the account panel in a browser: ${base}/login/page — then pick "开始新登录（扫码）". New logins take effect immediately without restarting.`

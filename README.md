@@ -29,7 +29,9 @@ third-party API.
 
 - **Two transports** — `wbipc` (zero credential storage, needs the desktop
   app running) and `direct` (real token-by-token streaming, no size/time
-  caps, works without the desktop app).
+  caps, works without the desktop app). Switch at runtime from the panel,
+  via `POST /config/mode`, or by asking the agent ("切到 direct 模式") —
+  no restart needed.
 - **Account panel** — `http://127.0.0.1:37321/login/page`: WeChat QR login,
   multi-account archive, one-click switching (effective immediately, no
   restart), credit balance.
@@ -85,7 +87,7 @@ All keys are read from `config.json` next to `index.js` (see
 
 | Key | Default | Meaning |
 |---|---|---|
-| `mode` | `wbipc` | `wbipc` or `direct` |
+| `mode` | `wbipc` | `wbipc` or `direct`; switchable at runtime (panel / `POST /config/mode` / agent tool) |
 | `realm` | `cn` | `cn` (copilot.tencent.com) or `global` (workbuddy.ai) |
 | `port` | `37321` | Local endpoint port |
 | `authToken` | auto-generated | Shared secret; must match `WORKBUDDY_PROXY_KEY` |

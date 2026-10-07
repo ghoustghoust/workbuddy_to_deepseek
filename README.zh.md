@@ -24,7 +24,7 @@ DSH ──► 本地桥接（本插件，OpenAI 兼容端点 127.0.0.1:37321）
 
 ## 功能
 
-- **双传输模式**：`wbipc`（零凭证落盘，需桌面端运行）/ `direct`（逐字流式、无 640KB/1MiB 限制、不依赖桌面端）
+- **双传输模式**：`wbipc`（零凭证落盘，需桌面端运行）/ `direct`（逐字流式、无 640KB/1MiB 限制、不依赖桌面端）。**运行时可切换**：面板按钮、`POST /config/mode`、或直接对 agent 说"切到 direct 模式"，无需重启
 - **切号面板**：`http://127.0.0.1:37321/login/page` —— 微信扫码登录、多账号存档、一键切换（即时生效无需重启）、余额查询、今日消耗
 - **DSH 工具**：注册 `workbuddy_account` 工具，在对话里直接说"切到 xx 账号""查下积分"即可
 - **每日积分护栏**：超过 `dailyCreditBudget` 自动拒答（0 = 不限制）
@@ -64,7 +64,7 @@ dsh credentials set WORKBUDDY_PROXY_KEY <首启打印的 authToken>
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `mode` | `wbipc` | `wbipc` 或 `direct` |
+| `mode` | `wbipc` | `wbipc` 或 `direct`；运行时可切（面板 / `POST /config/mode` / agent 工具） |
 | `realm` | `cn` | `cn`（copilot.tencent.com）/ `global`（workbuddy.ai） |
 | `port` | `37321` | 本地端点端口 |
 | `authToken` | 自动生成 | 共享密钥，需与 `WORKBUDDY_PROXY_KEY` 一致 |
