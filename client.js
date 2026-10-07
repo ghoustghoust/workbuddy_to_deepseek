@@ -36,12 +36,11 @@ window.__ModuleLoader__.load({
     };
 
     const CSS = `
-.wb{display:flex;flex-direction:column;gap:14px;color:${T.primary};font-size:13px;line-height:20px;padding-bottom:8px;min-width:0}
+.wb{display:flex;flex-direction:column;gap:14px;color:${T.primary};font-size:13px;line-height:20px;padding-bottom:8px;min-width:300px}
 .wb-h{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .wb-title{font-size:16px;font-weight:600;line-height:24px;white-space:nowrap}
 .wb-badge{font-size:11px;line-height:16px;padding:0 6px;border-radius:4px;background:${T.bgLayer};color:${T.tertiary};white-space:nowrap}
 .wb-card{border:1px solid ${T.border};border-radius:8px;padding:12px 14px;display:flex;flex-direction:column;gap:10px;min-width:0;container-type:inline-size}
-@container (max-width:260px){.wb-row{flex-direction:column;align-items:flex-start;gap:2px}}
 .wb-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;min-width:0}
 .wb-k{color:${T.secondary};flex:0 1 auto;min-width:0;white-space:nowrap}
 .wb-v{font-variant-numeric:tabular-nums;text-align:right;flex:1 1 auto;min-width:0;overflow-wrap:anywhere}
@@ -49,14 +48,23 @@ window.__ModuleLoader__.load({
 .wb-btn:hover{background:${T.hover}}
 .wb-btn:disabled{opacity:.5;cursor:default}
 .wb-btn.on{background:${T.accent};border-color:${T.accent};color:#fff}
-.wb-btns{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.wb-btns{display:flex;gap:6px;flex-wrap:wrap;align-items:center;min-width:0}
 .wb-ok{color:${T.success}} .wb-warn{color:${T.warn}} .b{font-weight:600}
-.wb-list{display:flex;flex-direction:column;gap:6px;max-height:280px;overflow-y:auto;min-width:0}
+.wb-list{display:flex;flex-direction:column;gap:6px;max-height:280px;overflow-y:auto;min-width:0;padding-right:8px;scrollbar-gutter:stable}
 .wb-price{display:flex;justify-content:space-between;align-items:baseline;gap:10px;padding:4px 0;border-bottom:1px solid ${T.border};min-width:0}
 .wb-price:last-child{border-bottom:0}
 .wb-pn{color:${T.primary};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto;min-width:0}
 .wb-pm{color:${T.tertiary};font-size:11px;flex:0 1 auto;text-align:right}
 .wb-msg{font-size:12px;color:${T.tertiary};min-height:16px;white-space:pre-wrap;overflow-wrap:anywhere}
+.wb-link{width:100%;box-sizing:border-box;font-size:11px;padding:5px 8px;border-radius:6px;border:1px solid ${T.border};background:${T.bgLayer};color:${T.secondary};font-family:inherit}
+/* DSH's settings modal keeps a fixed nav column, so on a narrow window the content
+   column can drop below 120px (host sections clip there too). Below this width
+   nothing stays legible, so take a horizontal scroll instead of shattering text. */
+@container (max-width:260px){
+  .wb-row{flex-direction:column;align-items:flex-start;gap:2px}
+  .wb-v{text-align:left}
+  .wb-btns{width:100%}
+}
 `;
 
     function fmtExpiry(ms) {
@@ -92,6 +100,7 @@ window.__ModuleLoader__.load({
       const [msg, setMsg] = useState("");
       const [busy, setBusy] = useState(false);
       const [bal, setBal] = useState(null);
+      const [loginUrl, setLoginUrl] = useState("");
       const pollRef = useRef(null);
 
       const reload = useCallback(async () => {
@@ -128,12 +137,14 @@ window.__ModuleLoader__.load({
         setBusy(true); setMsg("正在申请授权链接…");
         try {
           const r = await api("/login", { method: "POST", body: "{}" });
-          setMsg("请在打开的页面用微信确认，完成后自动检测…");
-          window.open(r.authUrl, "_blank");
+          // The desktop shell denies window.open, so always keep the link copyable.
+          setLoginUrl(r.authUrl);
+          const w = window.open(r.authUrl, "_blank");
+          setMsg(w ? "请在打开的页面用微信确认，完成后自动检测…" : "请复制链接到浏览器打开，用微信确认，完成后自动检测…");
           const deadline = Date.now() + 10 * 60 * 1000;
           if (pollRef.current) clearInterval(pollRef.current);
           pollRef.current = setInterval(async () => {
-            if (Date.now() > deadline) { clearInterval(pollRef.current); pollRef.current = null; setMsg("登录超时，请重试"); setBusy(false); return; }
+            if (Date.now() > deadline) { clearInterval(pollRef.current); pollRef.current = null; setMsg("登录超时，请重试"); setLoginUrl(""); setBusy(false); return; }
             try {
               const p = await api("/login/poll");
               if (p.status === "ok") {
@@ -220,6 +231,12 @@ window.__ModuleLoader__.load({
             React.createElement("button", { className: "wb-btn", disabled: busy, onClick: startLogin }, "扫码登录 / 加新账号"),
             React.createElement("button", { className: "wb-btn", disabled: busy, onClick: reload }, "刷新"),
           ),
+          loginUrl ? React.createElement("input", {
+            className: "wb-link",
+            readOnly: true,
+            value: loginUrl,
+            onClick: (e) => e.target.select(),
+          }) : null,
         ),
 
         // 传输模式

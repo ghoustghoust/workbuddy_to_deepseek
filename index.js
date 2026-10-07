@@ -108,10 +108,15 @@ function realm() { return REALMS[CONFIG.realm] ?? REALMS.cn }
 // logging
 // ---------------------------------------------------------------------------
 
-function todayLogPath() {
-  const d = new Date()
+// Local calendar day, not UTC: the budget, the price windows and the log file
+// names all follow the user's clock (a UTC day would roll the budget at 08:00).
+function localDay(d = new Date()) {
   const pad = (n) => String(n).padStart(2, '0')
-  return path.join(LOG_DIR, `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}.jsonl`)
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
+function todayLogPath() {
+  return path.join(LOG_DIR, `${localDay()}.jsonl`)
 }
 
 function appendLog(entry) {
@@ -137,25 +142,58 @@ function cleanOldLogs() {
 // ---------------------------------------------------------------------------
 
 let spend = { date: '', credits: 0 }
+let spendLoaded = false
+
+// state.json is only a cache. The day's request log is keyed by the same local
+// day and is what actually got charged, so rebuild from it once per day: a
+// stale, truncated or hand-edited state file must never disable the guard
+// (v1.0.x shipped a counter that read 0 while 1348 credits were already gone).
+function spendFromLog(day) {
+  if (!CONFIG.logRequests) return null // request entries are not being written; logs hold no charge data
+  let raw
+  try { raw = fs.readFileSync(path.join(LOG_DIR, `${day}.jsonl`), 'utf8') } catch { return null }
+  let total = 0
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue
+    let e
+    try { e = JSON.parse(line) } catch { continue }
+    const c = e?.usage?.credit
+    if (typeof c === 'number' && c > 0) total += c
+  }
+  return total
+}
+
+function persistSpend() {
+  try { fs.writeFileSync(STATE_FILE, JSON.stringify(spend), { mode: 0o600 }) } catch { /* ignore */ }
+}
 
 function loadSpend() {
-  try {
-    const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'))
-    if (s?.date === new Date().toISOString().slice(0, 10)) spend = s
-  } catch { /* first run */ }
+  const day = localDay()
+  if (spendLoaded && spend.date === day) return
+  const fromLog = spendFromLog(day)
+  if (fromLog != null) {
+    spend = { date: day, credits: fromLog }
+  } else {
+    spend = { date: day, credits: 0 }
+    try {
+      const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'))
+      if (s?.date === day && typeof s?.credits === 'number') spend = s
+    } catch { /* first run */ }
+  }
+  spendLoaded = true
+  persistSpend()
 }
 
 function addSpend(credit) {
-  const today = new Date().toISOString().slice(0, 10)
-  if (spend.date !== today) spend = { date: today, credits: 0 }
+  loadSpend()
   spend.credits += credit || 0
-  try { fs.writeFileSync(STATE_FILE, JSON.stringify(spend), { mode: 0o600 }) } catch { /* ignore */ }
+  persistSpend()
 }
 
 function budgetBlocked() {
   if (!(CONFIG.dailyCreditBudget > 0)) return false
   loadSpend()
-  return spend.date === new Date().toISOString().slice(0, 10) && spend.credits >= CONFIG.dailyCreditBudget
+  return spend.credits >= CONFIG.dailyCreditBudget
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,14 +1103,28 @@ function webSummary() {
   }
 }
 
+// A browser page always attaches Sec-Fetch-Site and script cannot delete it, so
+// its absence means the request did not originate from a web page. DSH's desktop
+// shell forwards panel fetches through its dsh-app:// proxy, which drops
+// sec-fetch-site + origin and injects its own Host session cookie — that header
+// shape is what the same UI looks like when it arrives from the app.
+function isLocalUi(req) {
+  const site = req.headers['sec-fetch-site']
+  if (site === 'same-origin' || site === 'none') return true
+  return site === undefined && req.headers.cookie !== undefined
+}
+
 async function webHandler(req, res) {
   const url = (req.url ?? '').split('?')[0]
   const sub = url.slice(WEB_PREFIX.length) || '/'
   try {
-    // token bootstrap: only for a genuinely same-origin browser page
+    // token bootstrap: for the DSH UI itself — either the browser page on the
+    // host's http origin (sec-fetch-site: same-origin) or the desktop shell,
+    // whose dsh-app:// proxy strips sec-fetch-site/origin and injects its own
+    // session cookie before forwarding here.
     if (req.method === 'GET' && sub === '/bootstrap') {
-      if (req.headers['sec-fetch-site'] !== 'same-origin') {
-        sendJson(res, 403, { error: { message: 'same-origin only' } })
+      if (!isLocalUi(req)) {
+        sendJson(res, 403, { error: { message: 'local UI only' } })
         return
       }
       sendJson(res, 200, { token: CONFIG.authToken })
