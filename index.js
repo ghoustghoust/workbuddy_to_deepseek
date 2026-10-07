@@ -45,8 +45,7 @@ const DEFAULTS = {
   clientVersion: '5.5.4', // WorkBuddy desktop version segment for UA
   cliVersion: '2.137.1', // CLI version segment for UA
   models: [
-    'deepseek-v4-pro', 'deepseek-v4-flash', 'glm-5.2',
-    'kimi-k3-1', 'minimax-m3', 'hy4-preview', 'hy3',
+    'deepseek-v3-2-volc', 'deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-v4.1-flash', 'glm-4.6', 'glm-4.6v', 'glm-4.7', 'glm-5.0', 'glm-5.0-turbo', 'glm-5.1', 'glm-5.2', 'glm-5.3', 'glm-5.3-flash', 'glm-5v-turbo', 'hunyuan-chat', 'hy3', 'hy3-x', 'hy4-preview', 'hy4-preview-x', 'kimi-k2-thinking', 'kimi-k2.5', 'kimi-k2.6', 'kimi-k2.7', 'kimi-k2.8-preview', 'kimi-k3-1', 'minimax-m2.5', 'minimax-m2.7', 'minimax-m3', 'space-bunny'
   ],
 }
 
