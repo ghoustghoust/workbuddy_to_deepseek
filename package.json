@@ -1,7 +1,7 @@
 {
   "name": "dsh-workbuddy-bridge",
-  "version": "1.2.0",
-  "description": "DeepSeek Harness plugin: use WorkBuddy credit-billed models inside DSH. Dual transport (desktop-forwarded IPC / direct OAuth device flow), real streaming, in-DSH settings panel for account switching and live pricing, daily credit budget.",
+  "version": "1.4.0",
+  "description": "DeepSeek Harness plugin: use WorkBuddy credit-billed models inside DSH. Dual transport (desktop-forwarded IPC / direct OAuth device flow), real streaming, hot-switchable cn/global sites with per-site credentials and budgets, live per-site model list pushed into DSH via its watched patch layer, in-DSH settings panel, daily credit budget.",
   "type": "module",
   "main": "index.js",
   "engines": {

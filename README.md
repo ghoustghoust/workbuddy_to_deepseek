@@ -32,11 +32,17 @@ third-party API.
   caps, works without the desktop app). Switch at runtime from the panel,
   via `POST /config/mode`, or by asking the agent ("切到 direct 模式") —
   no restart needed.
+- **Two sites, hot-switchable** — `cn` (copilot.tencent.com) and `global`
+  (workbuddy.ai) keep separate credentials (`auths/<site>/`), separate model
+  catalogs, separate daily budgets, and a separate desktop-app IPC endpoint.
+  Switching from the panel or `POST /config/realm` rewrites the DSH model layer
+  and takes effect immediately; a site with no reachable catalog is refused
+  rather than left serving the other site's models.
 - **In-DSH settings panel** — once installed as a bundle, DSH's Settings
   gains a **WorkBuddy 桥接** section: current account and credential expiry,
   credit balance, WeChat QR login / add account, saved-account switching,
-  runtime transport toggle, today's spend vs budget, and the live price
-  table. A browser fallback panel is also served at
+  runtime transport and site toggles, today's spend vs budget, and the live
+  price table. A browser fallback panel is also served at
   `http://127.0.0.1:37321/login/page` (useful before the bundle install).
 - **DSH tool** — `workbuddy_account`, callable by the agent to list / switch
   accounts, check balance, read live prices or switch transport ("切到 direct
@@ -46,6 +52,15 @@ third-party API.
 - **Local-only by design** — the endpoint binds to `127.0.0.1`, rejects
   cross-site browser requests and DNS-rebinding hosts, and requires a
   generated auth token. Conversation content is **not** logged by default.
+- **Live model list, per realm** — the exposed models are derived from the
+  realm's own catalog (`/v3/config`, fetched with the desktop client's UA, which
+  is the only one that returns the merged product+account config) and filtered
+  to the vendor's current picker whitelist, so retired models drop out and new
+  ones appear without an upgrade. Router tiers (Auto / Fast / Balanced / ...)
+  are left out because they bill at a floating multiplier. The result is written
+  to `~/.dsh/cordis.patch.yml`, which `dsh-hmr` watches — the picker updates
+  while Harness runs. Refresh needs a `direct` credential for that realm; the
+  `wbipc` transport cannot reach the catalog endpoint.
 - **Cache-aware** — DSH keeps prompt prefixes stable between turns, so the
   backend's prompt cache hits (measured in practice: ~70% input savings from
   the third turn on).
@@ -80,9 +95,14 @@ Harness.
 
 1. Start DeepSeek Harness. The bridge listens on `127.0.0.1:37321`.
 2. Pick a model in the **WorkBuddy (credits)** group.
-3. `wbipc` mode: keep the WorkBuddy desktop app running and logged in.
-   `direct` mode: open `http://127.0.0.1:37321/login/page` and scan the QR
-   once. Set `"mode": "direct"` in `config.json` and restart Harness.
+3. `wbipc` mode: keep the matching WorkBuddy desktop app running and logged
+   in. `direct` mode: open the panel (Settings → **WorkBuddy 桥接**, or
+   `http://127.0.0.1:37321/login/page`) and log in once. Both the transport
+   and the site (`cn` / `global`) can be switched from the panel afterwards
+   without restarting Harness.
+4. The model list refreshes on start, hourly, and after every login or site
+   switch. Refreshing it needs a `direct` credential for that realm — the
+   desktop IPC proxy will not forward the catalog endpoint.
 
 ## Configuration
 
@@ -92,15 +112,16 @@ All keys are read from `config.json` next to `index.js` (see
 | Key | Default | Meaning |
 |---|---|---|
 | `mode` | `wbipc` | `wbipc` or `direct`; switchable at runtime (panel / `POST /config/mode` / agent tool) |
-| `realm` | `cn` | `cn` (copilot.tencent.com) or `global` (workbuddy.ai) |
+| `realm` | `cn` | `cn` (copilot.tencent.com) or `global` (workbuddy.ai); switchable at runtime via the panel or `POST /config/realm`, which also rewrites the DSH model layer |
 | `port` | `37321` | Local endpoint port |
 | `authToken` | auto-generated | Shared secret; must match `WORKBUDDY_PROXY_KEY` |
-| `dailyCreditBudget` | `3000` | Daily credit spend limit, `0` = unlimited |
+| `dailyCreditBudget` | `3000` | Daily credit spend limit **per realm** (each realm bills its own account), `0` = unlimited |
 | `perRequestCreditBudget` | `1000` | Estimated single-request cap (runaway guard), `0` = off |
-| `logRequests` | `true` | Metadata log (model, tokens, cache hits, credit) |
+| `logRequests` | `true` | Metadata log (realm, model, tokens, cache hits, credit) |
 | `logBodies` | `false` | **Stores full conversation text in `logs/`** |
 | `logRetentionDays` | `7` | Auto-delete older logs |
-| `models` | 15 current models | Exposed model ids |
+| `clientVersion` | `5.7.6` | UA segment the backend uses to pick which catalog to serve; a stale value silently shrinks the model list |
+| `cliVersion` | `2.137.1` | UA segment for the CLI part of the three-segment user agent |
 
 ## Privacy
 

@@ -1,23 +1,13 @@
 {
-  "mode": "direct",
+  "mode": "wbipc",
   "realm": "cn",
   "port": 37321,
   "authToken": "",
   "dailyCreditBudget": 3000,
+  "perRequestCreditBudget": 1000,
   "logRequests": true,
   "logBodies": false,
   "logRetentionDays": 7,
-  "clientVersion": "5.5.4",
-  "cliVersion": "2.137.1",
-  "contextWindowCap": 400000,
-  "models": [
-    "deepseek-v4-pro",
-    "deepseek-v4-flash",
-    "glm-5.2",
-    "kimi-k3-1",
-    "minimax-m3",
-    "hy4-preview",
-    "hy3"
-  ],
-  "perRequestCreditBudget": 1000
+  "clientVersion": "5.7.6",
+  "cliVersion": "2.137.1"
 }

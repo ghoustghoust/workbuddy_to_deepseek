@@ -1,3 +1,9 @@
+# Bundle layer. The model list here is only what exists before the bridge has
+# ever reached the live catalog: the plugin regenerates the whole `workbuddy`
+# provider into ~/.dsh/cordis.patch.yml (which dsh-hmr watches, so it applies
+# without a restart) as soon as it has a realm's catalog. Keep this list to a
+# single placeholder — anything longer here is a stale snapshot that the picker
+# would show before the first refresh.
 - insert:
   - id: workbuddy-bridge
     name: dsh-workbuddy-bridge
@@ -6,127 +12,15 @@
   config:
     providers:
       workbuddy:
-        displayName: WorkBuddy 国际版 (预积分计费)
+        displayName: WorkBuddy (预积分计费)
         apiKeyEnv: WORKBUDDY_PROXY_KEY
         api: openai-completions
         baseURL: http://127.0.0.1:37321/v1
         models:
         - id: deepseek-v4.1-flash
-          name: Deepseek-V4.1-Flash (现免费)
+          name: Deepseek-V4.1-Flash
           input:
           - text
           - image
           contextWindow: 1000000
           maxTokens: 128000
-        - id: deepseek-v4.1-flash-sg
-          name: Deepseek-V4.1-Flash (x0.03)
-          input:
-          - text
-          - image
-          contextWindow: 1000000
-          maxTokens: 128000
-        - id: gpt-6-astra
-          name: GPT-6-Astra (x6.67)
-          input:
-          - text
-          - image
-          contextWindow: 1000000
-          maxTokens: 128000
-        - id: hy4-preview
-          name: Hy4 preview (x0.29)
-          input:
-          - text
-          - image
-          contextWindow: 1000000
-          maxTokens: 64000
-        - id: hy3
-          name: Hy3 (现免费)
-          input:
-          - text
-          - image
-          contextWindow: 192000
-          maxTokens: 64000
-        - id: kimi-k2.8-preview
-          name: Kimi-K2.8-Preview (x0.77)
-          input:
-          - text
-          - image
-          contextWindow: 1000000
-          maxTokens: 32000
-        - id: gpt-5.6-sol
-          name: GPT-5.6-Sol (x3.47)
-          input:
-          - text
-          - image
-          contextWindow: 1000000
-          maxTokens: 128000
-        - id: gpt-5.6-terra
-          name: GPT-5.6-Terra (x1.39)
-          input:
-          - text
-          - image
-          contextWindow: 1000000
-          maxTokens: 128000
-        - id: gpt-5.6-luna
-          name: GPT-5.6-Luna (x0.14)
-          input:
-          - text
-          - image
-          contextWindow: 1000000
-          maxTokens: 128000
-        - id: gpt-5.5
-          name: GPT-5.5 (x3.31)
-          input:
-          - text
-          - image
-          contextWindow: 1000000
-          maxTokens: 128000
-        - id: gpt-5.4
-          name: GPT-5.4 (x1.65)
-          input:
-          - text
-          - image
-          contextWindow: 272000
-          maxTokens: 72000
-        - id: gemini-3.5-flash
-          name: Gemini-3.5-Flash (x0.99)
-          input:
-          - text
-          - image
-          contextWindow: 1000000
-          maxTokens: 65536
-        - id: glm-5.3-flash
-          name: GLM-5.3-Flash (x0.06)
-          input:
-          - text
-          - image
-          contextWindow: 1000000
-          maxTokens: 32000
-        - id: glm-5.3
-          name: GLM-5.3 (x0.79)
-          input:
-          - text
-          - image
-          contextWindow: 1000000
-          maxTokens: 48000
-        - id: glm-5.2
-          name: GLM-5.2 (x0.79)
-          input:
-          - text
-          - image
-          contextWindow: 1000000
-          maxTokens: 48000
-        - id: kimi-k3
-          name: Kimi-K3 (x1.62)
-          input:
-          - text
-          - image
-          contextWindow: 1000000
-          maxTokens: 32000
-        - id: kimi-k2.6
-          name: Kimi-K2.6 (x0.52)
-          input:
-          - text
-          - image
-          contextWindow: 256000
-          maxTokens: 32000

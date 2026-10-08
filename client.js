@@ -116,6 +116,18 @@ window.__ModuleLoader__.load({
 
       useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
 
+      const setRealm = async (realm) => {
+        setBusy(true); setMsg("");
+        try {
+          const r = await api("/realm", { method: "POST", body: JSON.stringify({ realm }) });
+          const n = r.provider && r.provider.models ? r.provider.models : 0;
+          const head = "已切换" + (r.realm === "global" ? "国际版" : "国内版") + (n ? "，模型列表 " + n + " 个" : "，模型列表暂未更新");
+          setMsg(r.warnings && r.warnings.length ? head + "：\n" + r.warnings.join("\n") : head);
+          await reload();
+        } catch (e) { setMsg("切换失败：" + (e && e.message || e)); }
+        setBusy(false);
+      };
+
       const setMode = async (mode) => {
         setBusy(true); setMsg("");
         try {
@@ -237,6 +249,19 @@ window.__ModuleLoader__.load({
             value: loginUrl,
             onClick: (e) => e.target.select(),
           }) : null,
+        ),
+
+        // 账号站点（realm）
+        React.createElement("div", { className: "wb-card" },
+          React.createElement("div", { className: "wb-row" },
+            React.createElement("span", { className: "wb-k" }, "账号站点"),
+            React.createElement("span", { className: "wb-btns" },
+              React.createElement("button", { className: "wb-btn" + (s.realm === "global" ? "" : " on"), disabled: busy, onClick: () => setRealm("cn") }, "国内版"),
+              React.createElement("button", { className: "wb-btn" + (s.realm === "global" ? " on" : ""), disabled: busy, onClick: () => setRealm("global") }, "国际版"),
+            ),
+          ),
+          React.createElement("div", { className: "wb-msg" },
+            "切换即时生效：DSH 的分组名与模型列表由热重载更新，不用重启；两个站点各自保存登录凭证与模型目录。"),
         ),
 
         // 传输模式

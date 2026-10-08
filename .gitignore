@@ -7,8 +7,11 @@ Thumbs.db
 auth.json
 auths/
 state.json
+state-*.json
+catalog-*.json
 config.json
 logs/
+*.migrated
 
 # Node
 node_modules/

@@ -28,11 +28,8 @@ export const inject = ['tools']
 // logs survive an upgrade from the manual install to the bundle install.
 const DATA_DIR = path.join(os.homedir(), '.dsh', 'plugins', 'workbuddy-proxy')
 const LOG_DIR = path.join(DATA_DIR, 'logs')
-const AUTH_FILE = path.join(DATA_DIR, 'auth.json')
-const AUTHS_DIR = path.join(DATA_DIR, 'auths')
-const STATE_FILE = path.join(DATA_DIR, 'state.json')
+const AUTH_ROOT = path.join(DATA_DIR, 'auths')
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json')
-const CATALOG_FILE = path.join(DATA_DIR, 'catalog.json')
 
 try { fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 }) } catch { /* exists */ }
 
@@ -50,11 +47,10 @@ const DEFAULTS = {
   logRequests: true,
   logBodies: false, // WARNING: true stores full conversation text on disk
   logRetentionDays: 7,
-  clientVersion: '5.5.4', // WorkBuddy desktop version segment for UA
+  clientVersion: '5.7.6', // WorkBuddy desktop version segment for UA; the backend
+  //                         gates the model catalog on it, so a stale value here
+  //                         silently shrinks the exposed list.
   cliVersion: '2.137.1', // CLI version segment for UA
-  models: [
-    'deepseek-v4.1-flash', 'deepseek-v4.1-flash-sg', 'gpt-6-astra', 'hy4-preview', 'hy3', 'kimi-k2.8-preview', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gemini-3.5-flash', 'glm-5.3-flash', 'glm-5.3', 'glm-5.2', 'kimi-k3', 'kimi-k2.6'
-  ],
 }
 
 function loadConfig() {
@@ -73,6 +69,83 @@ function loadConfig() {
 
 const CONFIG = loadConfig()
 
+// Credentials and the model catalog are partitioned per realm: a CN token must
+// never be replayed against workbuddy.ai, and one merged catalog would keep
+// advertising models the other realm retired.
+function realmKey() { return CONFIG.realm === 'global' ? 'global' : 'cn' }
+function realmAuthDir(rk = realmKey()) { return path.join(AUTH_ROOT, rk) }
+function authFile(rk = realmKey()) { return path.join(realmAuthDir(rk), 'current.json') }
+function catalogFile(rk = realmKey()) { return path.join(DATA_DIR, `catalog-${rk}.json`) }
+
+// The pre-realm layout stored one shared auth.json plus auths/<uid>.json.
+// Returns null when nothing identifies the realm: guessing "cn" here would park
+// an international token where it gets replayed against copilot.tencent.com
+// forever, so such records are quarantined for a human instead.
+function legacyRealmOf(a) {
+  if (a?.realm === 'cn' || a?.realm === 'global') return a.realm
+  const domain = String(a?.domain ?? '')
+  if (domain.includes('workbuddy.ai')) return 'global'
+  if (domain.includes('codebuddy.cn') || domain.includes('copilot.tencent.com') || domain.includes('codebuddy.qq.com')) return 'cn'
+  return null
+}
+
+function migrateLegacyAuth() {
+  const flag = path.join(AUTH_ROOT, '.realm-split.done')
+  if (fs.existsSync(flag)) return
+  try { fs.mkdirSync(AUTH_ROOT, { recursive: true, mode: 0o700 }) } catch { /* exists */ }
+  const sources = []
+  try {
+    for (const f of fs.readdirSync(AUTH_ROOT)) if (f.endsWith('.json')) sources.push({ src: path.join(AUTH_ROOT, f), base: f })
+  } catch { /* nothing to migrate */ }
+  const legacyCurrent = path.join(DATA_DIR, 'auth.json')
+  if (fs.existsSync(legacyCurrent)) sources.push({ src: legacyCurrent, base: 'auth.json', destName: 'current.json' })
+
+  let placed = 0
+  let quarantined = 0
+  let failed = 0
+  for (const { src, base, destName } of sources) {
+    let rec = null
+    try { rec = JSON.parse(fs.readFileSync(src, 'utf8')) } catch { failed++; continue }
+    const uid = rec?.uid
+    if (!uid && !destName) { failed++; continue }
+    const rk = legacyRealmOf(rec)
+    if (!rk) {
+      // No realm evidence: keep the token, but out of the load path rather than
+      // guessing a realm and replaying it against the wrong backend.
+      try {
+        const q = path.join(AUTH_ROOT, 'unsorted')
+        fs.mkdirSync(q, { recursive: true, mode: 0o700 })
+        fs.renameSync(src, path.join(q, destName ? base : `${uid}.json`))
+        quarantined++
+      } catch { failed++ }
+      continue
+    }
+    const dir = path.join(AUTH_ROOT, rk)
+    try {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+      const dest = path.join(dir, destName ?? `${uid}.json`)
+      if (!fs.existsSync(dest)) fs.copyFileSync(src, dest)
+      placed++
+    } catch { failed++ }
+  }
+  // Only a run where nothing went wrong may retire the legacy copies and mark
+  // itself complete; a partial run retries on the next start.
+  if (failed === 0) {
+    for (const { src, base } of sources) {
+      if (base === 'auth.json') continue // left below
+      try { fs.renameSync(src, `${src}.migrated`) } catch { /* best effort */ }
+    }
+    try { if (fs.existsSync(legacyCurrent)) fs.renameSync(legacyCurrent, `${legacyCurrent}.migrated`) } catch { /* best effort */ }
+    try {
+      fs.writeFileSync(flag, JSON.stringify({ at: new Date().toISOString(), placed, quarantined }))
+    } catch { /* best effort */ }
+  }
+  if (placed || quarantined || failed) {
+    appendLog({ ts: new Date().toISOString(), event: 'auth_realm_migration', placed, quarantined, failed })
+  }
+}
+migrateLegacyAuth()
+
 function setMode(mode) {
   if (mode !== 'wbipc' && mode !== 'direct') return false
   CONFIG.mode = mode
@@ -83,6 +156,38 @@ function setMode(mode) {
   } catch { /* in-memory switch still applies */ }
   appendLog({ ts: new Date().toISOString(), event: 'mode_switch', mode })
   return true
+}
+
+function setRealm(next) {
+  if (next !== 'cn' && next !== 'global') return false
+  if (next === CONFIG.realm) return true
+  CONFIG.realm = next
+  try {
+    const disk = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'))
+    disk.realm = next
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(disk, null, 2), { mode: 0o600 })
+  } catch { /* in-memory switch still applies */ }
+  // Everything realm-derived has to be re-read: the catalog, the desktop IPC
+  // connection, and a login started against the other realm must not land here.
+  try {
+    catalog = JSON.parse(fs.readFileSync(catalogFile(), 'utf8'))
+  } catch {
+    catalog = { models: {}, promos: {}, picker: [], fetchedAt: null }
+  }
+  if (!Array.isArray(catalog.picker)) catalog.picker = []
+  spendLoaded = false // each realm carries its own daily allowance
+  wbipc.drop()
+  pendingLogin = null
+  appendLog({ ts: new Date().toISOString(), event: 'realm_switch', realm: next })
+  return true
+}
+
+function realmSwitchWarnings() {
+  const w = []
+  if (!loadAuth()) w.push(`${CONFIG.realm === 'global' ? '国际版' : '国内版'}还没有登录凭证：模型列表会保持上一次的内容，直到你扫码`)
+  try { readEndpoint() } catch { w.push(`对应桌面端未运行，wbipc 请求会失败（${realm().configDir}）`) }
+  if (wbipcPinned()) w.push(`WORKBUDDY_CONFIG_DIR/CODEBUDDY_CONFIG_DIR 已把 IPC 钉死在 ${wbipcConfigDir()}，切换 realm 不会改连到另一个桌面端`)
+  return w
 }
 
 const REALMS = {
@@ -124,7 +229,9 @@ function todayLogPath() {
 function appendLog(entry) {
   try {
     fs.mkdirSync(LOG_DIR, { recursive: true })
-    fs.appendFileSync(todayLogPath(), JSON.stringify(entry) + '\n')
+    // Every entry carries the realm it was recorded under, so each realm's
+    // daily budget can be rebuilt from the log alone.
+    fs.appendFileSync(todayLogPath(), JSON.stringify({ realm: CONFIG.realm, ...entry }) + '\n')
   } catch { /* logging must never break the proxy */ }
 }
 
@@ -145,12 +252,19 @@ function cleanOldLogs() {
 
 let spend = { date: '', credits: 0 }
 let spendLoaded = false
+let spendRealm = ''
+
+function stateFile(rk = realmKey()) { return path.join(DATA_DIR, `state-${rk}.json`) }
 
 // state.json is only a cache. The day's request log is keyed by the same local
 // day and is what actually got charged, so rebuild from it once per day: a
 // stale, truncated or hand-edited state file must never disable the guard
 // (v1.0.x shipped a counter that read 0 while 1348 credits were already gone).
-function spendFromLog(day) {
+// Each realm bills its own account, so each realm gets its own budget: spending
+// the CN allowance must not lock out a fresh international account or reverse.
+// Entries written before the realm was recorded are CN-era traffic and stay in
+// the CN ledger.
+function spendFromLog(day, rk) {
   if (!CONFIG.logRequests) return null // request entries are not being written; logs hold no charge data
   let raw
   try { raw = fs.readFileSync(path.join(LOG_DIR, `${day}.jsonl`), 'utf8') } catch { return null }
@@ -159,6 +273,7 @@ function spendFromLog(day) {
     if (!line.trim()) continue
     let e
     try { e = JSON.parse(line) } catch { continue }
+    if ((e?.realm ?? 'cn') !== rk) continue
     const c = e?.usage?.credit
     if (typeof c === 'number' && c > 0) total += c
   }
@@ -166,23 +281,25 @@ function spendFromLog(day) {
 }
 
 function persistSpend() {
-  try { fs.writeFileSync(STATE_FILE, JSON.stringify(spend), { mode: 0o600 }) } catch { /* ignore */ }
+  try { fs.writeFileSync(stateFile(), JSON.stringify(spend), { mode: 0o600 }) } catch { /* ignore */ }
 }
 
 function loadSpend() {
   const day = localDay()
-  if (spendLoaded && spend.date === day) return
-  const fromLog = spendFromLog(day)
+  const rk = realmKey()
+  if (spendLoaded && spend.date === day && spendRealm === rk) return
+  const fromLog = spendFromLog(day, rk)
   if (fromLog != null) {
     spend = { date: day, credits: fromLog }
   } else {
     spend = { date: day, credits: 0 }
     try {
-      const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'))
+      const s = JSON.parse(fs.readFileSync(stateFile(rk), 'utf8'))
       if (s?.date === day && typeof s?.credits === 'number') spend = s
     } catch { /* first run */ }
   }
   spendLoaded = true
+  spendRealm = rk
   persistSpend()
 }
 
@@ -202,30 +319,37 @@ function budgetBlocked() {
 // auth store (direct mode): plaintext tokens, restricted file permissions
 // ---------------------------------------------------------------------------
 
-function loadAuth() {
+function loadAuth(rk = realmKey()) {
   try {
-    const a = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8'))
-    return a?.accessToken ? a : null
+    const a = JSON.parse(fs.readFileSync(authFile(rk), 'utf8'))
+    if (!a?.accessToken) return null
+    // A record stamped with another realm must never be replayed here; records
+    // predating the split carry no stamp and are trusted by their directory.
+    if (a.realm && a.realm !== rk) return null
+    return a
   } catch { return null }
 }
 
-function saveAuth(a) {
+function saveAuth(a, rk = realmKey()) {
   a.updatedAt = new Date().toISOString()
-  fs.writeFileSync(AUTH_FILE, JSON.stringify(a, null, 2), { mode: 0o600 })
-  try { fs.chmodSync(AUTH_FILE, 0o600) } catch { /* best effort on win32 */ }
+  a.realm = rk
+  const dir = realmAuthDir(rk)
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const file = authFile(rk)
+  fs.writeFileSync(file, JSON.stringify(a, null, 2), { mode: 0o600 })
+  try { fs.chmodSync(file, 0o600) } catch { /* best effort on win32 */ }
   if (a.uid) {
     try {
-      fs.mkdirSync(AUTHS_DIR, { recursive: true, mode: 0o700 })
-      fs.writeFileSync(path.join(AUTHS_DIR, `${a.uid}.json`), JSON.stringify(a, null, 2), { mode: 0o600 })
+      fs.writeFileSync(path.join(dir, `${a.uid}.json`), JSON.stringify(a, null, 2), { mode: 0o600 })
     } catch { /* best effort */ }
   }
 }
 
 function listAuths() {
   try {
-    return fs.readdirSync(AUTHS_DIR).filter((f) => f.endsWith('.json')).map((f) => {
+    return fs.readdirSync(realmAuthDir()).filter((f) => f.endsWith('.json') && f !== 'current.json').map((f) => {
       try {
-        const a = JSON.parse(fs.readFileSync(path.join(AUTHS_DIR, f), 'utf8'))
+        const a = JSON.parse(fs.readFileSync(path.join(realmAuthDir(), f), 'utf8'))
         return { uid: a.uid ?? f.replace(/\.json$/, ''), nickname: a.nickname, updatedAt: a.updatedAt }
       } catch { return { uid: f.replace(/\.json$/, '') } }
     })
@@ -234,7 +358,7 @@ function listAuths() {
 
 function switchAuth(uid) {
   try {
-    const a = JSON.parse(fs.readFileSync(path.join(AUTHS_DIR, `${uid}.json`), 'utf8'))
+    const a = JSON.parse(fs.readFileSync(path.join(realmAuthDir(), `${uid}.json`), 'utf8'))
     if (!a?.accessToken) return null
     saveAuth(a)
     return a
@@ -245,8 +369,7 @@ function switchAuth(uid) {
 // header builders (mirrors the official client's outbound header families)
 // ---------------------------------------------------------------------------
 
-function threeSegmentUA() {
-  const r = realm()
+function threeSegmentUA(r = realm()) {
   return `WorkBuddy/${CONFIG.clientVersion} ${r.uaPlatform}/${CONFIG.clientVersion} CLI/${CONFIG.cliVersion}`
 }
 
@@ -256,8 +379,7 @@ function hex36(seed) {
 
 function msgId() { return crypto.randomUUID().replace(/-/g, '') }
 
-function loginHeaders() {
-  const r = realm()
+function loginHeaders(r = realm()) {
   return {
     'content-type': 'application/json',
     accept: 'application/json, text/plain, */*',
@@ -277,8 +399,7 @@ function stableHeaders(uid) {
   }
 }
 
-function chatHeaders(a, convReqId) {
-  const r = realm()
+function chatHeaders(a, convReqId, r = realm()) {
   const messageId = msgId()
   const h = {
     'content-type': 'application/json',
@@ -337,49 +458,69 @@ let pendingLogin = null // { state, startedAt }
 
 const SH_OFFSET_MS = 8 * 3600_000 // Asia/Shanghai has no DST
 
-let catalog = { models: {}, promos: {}, fetchedAt: null }
-try { catalog = JSON.parse(fs.readFileSync(CATALOG_FILE, 'utf8')) } catch { /* first run */ }
+let catalog = { models: {}, promos: {}, picker: [], fetchedAt: null }
+try { catalog = JSON.parse(fs.readFileSync(catalogFile(), 'utf8')) } catch { /* first run */ }
+if (!Array.isArray(catalog.picker)) catalog.picker = []
+
+// The vendor's router tiers (Auto / Fast / Balanced / Primary / Deep) resolve to
+// a model chosen per request and bill at a floating multiplier, so they are not
+// something to hand to DSH as a selectable model.
+function isRouterTier(id) { return id === 'auto' || id === 'default' || /-model$/.test(id) }
+
+// Model ids are echoed into a YAML file that the harness loads; keep them to
+// what a model id actually looks like in either realm.
+const SAFE_MODEL_ID = /^[\w][\w.@:-]{0,63}$/
+
+function positiveInt(v) {
+  const n = Number(v)
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0
+}
 
 async function fetchCatalog() {
-  const a = loadAuth()
-  if (!a) return // pricing needs direct-mode credentials
-  const r = realm()
-  const host = new URL(r.chatBase).host
-  const headers = (ua) => ({
-    accept: 'application/json, text/plain, */*',
-    'x-requested-with': 'XMLHttpRequest',
-    authorization: `Bearer ${a.accessToken}`,
-    'x-user-id': a.uid ?? '',
-    'x-domain': host,
-    'x-product': 'SaaS',
-    'user-agent': ua,
-    'x-codebuddy-request': '1',
-    'accept-language': r.acceptLanguage,
+  const rk = realmKey()
+  const a = loadAuth(rk)
+  if (!a) return // the catalog needs direct-mode credentials
+  const r = REALMS[rk] ?? REALMS.cn
+  // The backend gates the catalog on the client UA. Only the desktop client's
+  // three-segment UA returns the merged product+account config the picker
+  // actually uses — the CLI UA and the IDE UA each return a smaller, older
+  // list with no promotions, which is what made the exposed models drift.
+  const res = await fetch(`${r.chatBase}/v3/config`, {
+    headers: {
+      accept: 'application/json, text/plain, */*',
+      'x-requested-with': 'XMLHttpRequest',
+      authorization: `Bearer ${a.accessToken}`,
+      'x-user-id': a.uid ?? '',
+      'x-domain': new URL(r.chatBase).host,
+      'x-product': 'SaaS',
+      'user-agent': threeSegmentUA(),
+      'x-codebuddy-request': '1',
+      'accept-language': r.acceptLanguage,
+    },
   })
-  const out = { models: { ...catalog.models }, promos: { ...catalog.promos }, fetchedAt: catalog.fetchedAt }
-  const sources = [
-    [`CLI/${CONFIG.cliVersion} CodeBuddy/${CONFIG.cliVersion}`, false],
-    ['CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0', true], // promotions ship with the IDE UA only
-  ]
-  for (const [ua, wantPromos] of sources) {
-    try {
-      const res = await fetch(`${r.chatBase}/v3/config`, { headers: headers(ua) })
-      const env = await res.json().catch(() => null)
-      const data = env?.data
-      if (!data) continue
-      for (const m of data.models ?? []) out.models[m.id] = m
-      if (wantPromos) {
-        out.promos = {}
-        for (const p of data.modelPromotions ?? []) {
-          if (!p.enabled) continue
-          for (const mid of p.modelIds ?? []) (out.promos[mid] ??= []).push(p)
-        }
-      }
-    } catch { /* keep previous catalog */ }
+  const env = await res.json().catch(() => null)
+  const data = env?.data
+  if (!data?.models?.length) return
+  const models = {}
+  for (const m of data.models) models[m.id] = m
+  const promos = {}
+  for (const p of data.modelPromotions ?? []) {
+    if (!p.enabled) continue
+    for (const mid of p.modelIds ?? []) (promos[mid] ??= []).push(p)
   }
-  out.fetchedAt = new Date().toISOString()
-  catalog = out
-  try { fs.writeFileSync(CATALOG_FILE, JSON.stringify(out)) } catch { /* ignore */ }
+  const agent = (data.agents ?? []).find((x) => (x.tags ?? []).includes('default'))
+  const picker = (agent?.models ?? []).filter((id) => !isRouterTier(id) && models[id])
+  // A retired model has to disappear, so a successful fetch replaces the
+  // catalog outright instead of merging into yesterday's copy. An empty picker
+  // keeps the previous one rather than silently blanking the provider.
+  if (realmKey() !== rk) return // realm switched during the await: nothing above is valid
+  catalog = {
+    models,
+    promos,
+    picker: picker.length ? picker : catalog.picker,
+    fetchedAt: new Date().toISOString(),
+  }
+  try { fs.writeFileSync(catalogFile(rk), JSON.stringify(catalog)) } catch { /* ignore */ }
 }
 
 function nowSH() { return new Date(Date.now() + SH_OFFSET_MS) } // read with UTC getters
@@ -428,8 +569,8 @@ function effectivePrice(mid) {
     if (!promoActive(p)) continue
     if (!best || (p.priority ?? 0) > (best.priority ?? 0)) best = p
   }
-  loadSpend()
-  const exhausted = freeExhausted[mid]
+  loadFreeExhausted()
+  const exhausted = freeExhausted[freeKey(mid)]
   if (best?.discount && !exhausted) {
     const f = best.discount.factor
     const note = windowNote(best)
@@ -444,45 +585,219 @@ function effectivePrice(mid) {
   return { base, effective: base, free: false, label: best?.badge?.label ?? '', note: hover || windowNote(best), exhausted: !!exhausted }
 }
 
+// What DSH should offer: the realm's live picker whitelist, and nothing else.
+// Falling back to the bundled list here would re-introduce the stale snapshot
+// this whole path exists to remove.
+function exposedModels() {
+  const ids = catalog.picker
+  const out = []
+  for (const id of ids) {
+    const m = catalog.models[id]
+    if (!m) continue
+    // The id and both capacity numbers reach an unquoted or plainly-quoted YAML
+    // slot, and they originate from a network response: constrain them here
+    // rather than trusting the emitter.
+    if (!SAFE_MODEL_ID.test(id)) continue
+    const contextWindow = positiveInt(m.maxInputTokens)
+    if (contextWindow === 0) continue
+    const maxTokens = positiveInt(m.maxOutputTokens)
+    const ep = effectivePrice(id)
+    const base = typeof m.name === 'string' && m.name ? m.name : id
+    let name = base
+    if (ep?.free) name = `${base} (现免费)`
+    else if (ep) name = ep.effective === ep.base ? `${base} (x${ep.base})` : `${base} (x${ep.effective}·原价x${ep.base})`
+    out.push({
+      id,
+      name,
+      input: m.supportsImages === false ? ['text'] : ['text', 'image'],
+      contextWindow,
+      maxTokens,
+    })
+  }
+  // The vendor ships distinct ids under one display name (hy4-preview and
+  // hy4-preview-f are both "Hy4 preview"), which is unclickable in a flat
+  // picker; only labels that actually collide get their id appended.
+  const count = new Map()
+  for (const m of out) count.set(m.name, (count.get(m.name) ?? 0) + 1)
+  for (const m of out) if (count.get(m.name) > 1) m.name = `${m.name}·${m.id}`
+  return out
+}
+
 // pricing snapshot for panel/tool — restricted to the models we actually expose
 function pricingList() {
-  const exposed = new Set(CONFIG.models)
-  return Object.keys(catalog.models)
-    .filter((mid) => exposed.has(mid))
-    .map((mid) => {
-      const m = catalog.models[mid]
-      const ep = effectivePrice(mid)
-      return {
-        id: mid,
-        name: m.name || mid,
-        base: ep?.base ?? parseMult(m.credits),
-        effective: ep?.effective ?? null,
-        free: !!ep?.free,
-        label: ep?.label ?? '',
-        note: ep?.note ?? '',
-        exhausted: !!ep?.exhausted,
-      }
+  const out = []
+  for (const e of exposedModels()) {
+    const ep = effectivePrice(e.id)
+    if (!ep) continue
+    const m = catalog.models[e.id]
+    out.push({
+      id: e.id,
+      name: m.name || e.id,
+      base: ep.base,
+      effective: ep.effective,
+      free: !!ep.free,
+      label: ep.label ?? '',
+      note: ep.note ?? '',
+      exhausted: !!ep.exhausted,
     })
-    .filter((x) => x.base !== null)
-    .sort((a, b) => (a.effective ?? 9) - (b.effective ?? 9))
+  }
+  return out.sort((a, b) => (a.effective ?? 9) - (b.effective ?? 9))
+}
+
+// ---------------------------------------------------------------------------
+// DSH provider declaration: the model list lives in the harness home patch so
+// the picker follows the live catalog. dsh-hmr watches this exact file and
+// recomposes the profile, so a change applies without restarting Harness; a
+// patch row with the same id replaces the whole `config`, which is why the
+// block restates every provider field rather than only `models`.
+// ---------------------------------------------------------------------------
+
+const HOME_PATCH_FILE = path.join(os.homedir(), '.dsh', 'cordis.patch.yml')
+const BLOCK_BEGIN = '# >>> generated by dsh-workbuddy-bridge — do not edit this block'
+const BLOCK_END = '# <<< generated by dsh-workbuddy-bridge'
+
+// JSON.stringify leaves U+0085 / U+2028 / U+2029 raw, and some YAML parsers
+// end a quoted scalar at those, so escape them too.
+const yamlStr = (s) => JSON.stringify(String(s)).replace(/[\u0085\u2028\u2029]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`)
+
+function providerDisplayName() {
+  return CONFIG.realm === 'global' ? 'WorkBuddy 国际版 (预积分计费)' : 'WorkBuddy 国内版 (预积分计费)'
+}
+
+function renderProviderBlock(models) {
+  const lines = [
+    BLOCK_BEGIN,
+    '- id: llm-pi-ai',
+    `  name: '@deepseek-ai/dsh-llm-pi-ai'`,
+    '  config:',
+    '    providers:',
+    '      workbuddy:',
+    `        displayName: ${yamlStr(providerDisplayName())}`,
+    '        apiKeyEnv: WORKBUDDY_PROXY_KEY',
+    '        api: openai-completions',
+    `        baseURL: ${yamlStr(`http://127.0.0.1:${CONFIG.port}/v1`)}`,
+    '        models:',
+  ]
+  for (const m of models) {
+    lines.push(`        - id: ${yamlStr(m.id)}`)
+    lines.push(`          name: ${yamlStr(m.name)}`)
+    lines.push('          input:')
+    for (const mod of m.input) lines.push(`          - ${yamlStr(mod)}`)
+    lines.push(`          contextWindow: ${m.contextWindow}`)
+    lines.push(`          maxTokens: ${m.maxTokens}`)
+  }
+  lines.push(BLOCK_END)
+  return lines.join('\n') + '\n'
+}
+
+// Markers are only recognised as whole comment lines, and an ambiguous file is
+// refused rather than guessed at: the previous indexOf arithmetic silently
+// deleted whatever sat between a user's stray begin marker and our own end one.
+function spliceManagedBlock(existing, block) {
+  const lines = (existing ?? '').split('\n')
+  const isBegin = (l) => l.trimEnd() === BLOCK_BEGIN
+  const isEnd = (l) => l.trimEnd() === BLOCK_END
+  let begin = -1
+  for (let i = 0; i < lines.length; i++) if (isBegin(lines[i])) begin = i
+  if (begin < 0) {
+    if (lines.some(isEnd)) return { error: 'stray end marker without a matching begin marker' }
+    const text = lines.join('\n')
+    return { text: text.trim().length ? `${text.replace(/\n*$/, '')}\n\n${block}` : block }
+  }
+  let end = -1
+  for (let i = begin + 1; i < lines.length; i++) {
+    if (isBegin(lines[i])) return { error: 'nested begin markers' }
+    if (isEnd(lines[i])) { end = i; break }
+  }
+  if (end < 0) return { error: 'managed block is unterminated' }
+  for (let i = 0; i < begin; i++) if (isBegin(lines[i]) || isEnd(lines[i])) return { error: 'stray markers above the managed block' }
+  return { text: [...lines.slice(0, begin), ...block.replace(/\n+$/, '').split('\n'), ...lines.slice(end + 1)].join('\n') }
+}
+
+let providerSync = { state: 'pending', models: 0, at: null, error: null }
+
+function syncProviderPatch() {
+  const models = exposedModels()
+  if (models.length === 0) {
+    providerSync = { state: 'no-catalog', models: 0, at: new Date().toISOString(), error: 'no live catalog for this realm — log in once so the bridge can read the model whitelist' }
+    return providerSync
+  }
+  const block = renderProviderBlock(models)
+  let current = null
+  try { current = fs.readFileSync(HOME_PATCH_FILE, 'utf8') } catch { /* first write */ }
+  const spliced = spliceManagedBlock(current, block)
+  if (spliced.error) {
+    providerSync = { state: 'refused', models: models.length, at: new Date().toISOString(), error: `${HOME_PATCH_FILE}: ${spliced.error}; not overwriting` }
+    appendLog({ ts: new Date().toISOString(), event: 'provider_patch_refused', error: providerSync.error })
+    return providerSync
+  }
+  if (current === spliced.text) {
+    providerSync = { state: 'in-sync', models: models.length, at: providerSync.at ?? new Date().toISOString(), error: null }
+    return providerSync
+  }
+  const tmp = `${HOME_PATCH_FILE}.dsh-workbuddy-${process.pid}-${Date.now()}.tmp`
+  try {
+    // 'wx' so a pre-existing or symlinked temp path can never be followed, and
+    // so two instances cannot truncate each other's file.
+    const fd = fs.openSync(tmp, 'wx', 0o600)
+    try { fs.writeFileSync(fd, spliced.text) } finally { fs.closeSync(fd) }
+    if (current !== null) {
+      const last = `${HOME_PATCH_FILE}.last`
+      const lfd = fs.openSync(last, 'w', 0o600)
+      try { fs.writeFileSync(lfd, current) } finally { fs.closeSync(lfd) }
+    }
+    fs.renameSync(tmp, HOME_PATCH_FILE)
+    providerSync = { state: 'written', models: models.length, at: new Date().toISOString(), error: null }
+    appendLog({ ts: new Date().toISOString(), event: 'provider_patch', models: models.length, realm: CONFIG.realm })
+  } catch (e) {
+    providerSync = { state: 'failed', models: models.length, at: new Date().toISOString(), error: String(e?.message ?? e) }
+    appendLog({ ts: new Date().toISOString(), event: 'provider_patch_failed', error: providerSync.error })
+    try { fs.rmSync(tmp, { force: true }) } catch { /* best effort */ }
+  }
+  return providerSync
+}
+
+async function refreshProvider() {
+  await fetchCatalog().catch(() => {})
+  return syncProviderPatch()
+}
+
+// A realm that yields no models must never be left live: the provider row would
+// keep advertising the previous realm's ids against the new token and endpoint.
+async function switchRealmGuarded(next) {
+  const prev = CONFIG.realm
+  if (prev !== next) setRealm(next)
+  await fetchCatalog().catch(() => {})
+  if (exposedModels().length === 0) {
+    if (prev !== next) setRealm(prev)
+    return {
+      ok: false,
+      realm: CONFIG.realm,
+      error: `${next === 'global' ? '国际版' : '国内版'}拿不到模型目录（该站点需要先有一次 direct 登录），已回退到 ${providerDisplayName()}`,
+    }
+  }
+  return { ok: true, realm: CONFIG.realm, warnings: realmSwitchWarnings(), provider: syncProviderPatch() }
 }
 
 // free-quota exhaustion: a model whose promo price is 0 but that returned
 // credit > 0 has used up its daily free allowance — record for today.
 let freeExhausted = {}
+// Both the day and the realm are part of the key: a model that burned its free
+// allowance on CN says nothing about the same id on the international account.
 function loadFreeExhausted() {
   loadSpend() // ensures spend.date is today
-  if (freeExhausted.__date !== spend.date) {
-    freeExhausted = { __date: spend.date }
-  }
+  const key = `${spend.date}:${realmKey()}`
+  if (freeExhausted.__key !== key) freeExhausted = { __key: key }
 }
+
+function freeKey(modelId) { return `${realmKey()}:${modelId}` }
 
 function markFreeExhaustedIfNeeded(modelId, credit) {
   if (!credit) return
   const ep = effectivePrice(modelId)
   if (ep?.free) {
     loadFreeExhausted()
-    freeExhausted[modelId] = true
+    freeExhausted[freeKey(modelId)] = true
     appendLog({ ts: new Date().toISOString(), event: 'free_quota_exhausted', model: modelId })
   }
 }
@@ -494,13 +809,13 @@ function markFreeExhaustedIfNeeded(modelId, credit) {
 class DirectClient {
   constructor() { this.refreshing = null }
 
-  async refreshForce(a) {
-    const r = realm()
+  async refreshForce(a, rk = realmKey()) {
+    const r = REALMS[rk] ?? REALMS.cn
     const res = await fetch(`${r.chatBase}/v2/plugin/auth/token/refresh`, {
       method: 'POST',
       headers: {
-        ...loginHeaders(),
-        'user-agent': threeSegmentUA(),
+        ...loginHeaders(r),
+        'user-agent': threeSegmentUA(r),
         'x-refresh-token': a.refreshToken,
         'x-auth-refresh-source': 'plugin',
         ...(a.enterpriseId ? { 'x-enterprise-id': a.enterpriseId } : {}),
@@ -515,34 +830,80 @@ class DirectClient {
     a.accessToken = env.data.accessToken
     if (env.data.refreshToken) a.refreshToken = env.data.refreshToken
     if (env.data.expiresIn) a.expiresAt = Date.now() + env.data.expiresIn * 1000
-    saveAuth(a)
-    appendLog({ ts: new Date().toISOString(), event: 'token_refreshed', uid: a.uid })
+    saveAuth(a, rk)
+    appendLog({ ts: new Date().toISOString(), event: 'token_refreshed', uid: a.uid, realm: rk })
   }
 
-  async ensureToken() {
-    const a = loadAuth()
+  async ensureToken(rk = realmKey()) {
+    const a = loadAuth(rk)
     if (!a) throw Object.assign(new Error('direct mode is not logged in'), { needsLogin: true })
     if (a.expiresAt && a.expiresAt - Date.now() < 10 * 60 * 1000 && a.refreshToken) {
-      this.refreshing ??= this.refreshForce(a).finally(() => { this.refreshing = null })
+      this.refreshing ??= this.refreshForce(a, rk).finally(() => { this.refreshing = null })
       await this.refreshing
     }
     return a
   }
 
+  // The realm can be switched by the panel while a request is in flight, so the
+  // realm, the endpoint and the token are all pinned here: a cn bearer must
+  // never be sent to workbuddy.ai just because the switch landed mid-await.
+  async openAuthorized(payloadStr, signal) {
+    const rk = realmKey()
+    const r = REALMS[rk] ?? REALMS.cn
+    const stillPinned = () => {
+      if (realmKey() !== rk) throw Object.assign(new Error(`realm changed to ${rk === 'global' ? 'cn' : 'global'} mid-request; retry`), { realmChanged: true })
+    }
+    let a = await this.ensureToken(rk)
+    stillPinned()
+    const convReqId = msgId()
+    let upstream = await this.send(a, payloadStr, convReqId, signal, r)
+    if (upstream.status === 401 && a.refreshToken) {
+      appendLog({ ts: new Date().toISOString(), event: 'token_401_retry', uid: a.uid, realm: rk })
+      await this.refreshForce(a, rk)
+      stillPinned()
+      a = loadAuth(rk)
+      upstream = await this.send(a, payloadStr, convReqId, signal, r)
+    }
+    return upstream
+  }
+
+  // `stream: false` still has to answer with one JSON completion, so the SSE is
+  // collected and folded instead of pumped to the client.
+  async chatCollected(payloadStr, req, logCtx) {
+    const t0 = Date.now()
+    const model = JSON.parse(payloadStr).model
+    const ac = new AbortController()
+    req.on('close', () => ac.abort(new Error('client disconnected')))
+    let status = 0
+    let usage = null
+    try {
+      const upstream = await this.openAuthorized(payloadStr, ac.signal)
+      status = upstream.status
+      const text = await upstream.text()
+      const isSse = text.includes('data: ')
+      const parsed = isSse ? parseSse(text) : { chunks: [], usage: null }
+      usage = parsed.usage
+      return { status, isSse, text, chunks: parsed.chunks, usage, model }
+    } finally {
+      // A client that walks away mid-collect must still reach the ledger, or
+      // the credits it actually spent go uncounted.
+      addSpend(usage?.credit ?? 0)
+      markFreeExhaustedIfNeeded(model, usage?.credit ?? 0)
+      if (CONFIG.logRequests) {
+        appendLog({
+          ts: new Date().toISOString(), event: 'request', mode: 'direct', status,
+          model, durationMs: Date.now() - t0, ...logCtx, usage: usageSummary(usage),
+        })
+      }
+    }
+  }
+
   async chat(payloadStr, res, req, logCtx) {
     const t0 = Date.now()
-    let a = await this.ensureToken()
-    const convReqId = msgId()
     const ac = new AbortController()
     req.on('close', () => ac.abort(new Error('client disconnected')))
 
-    let upstream = await this.send(a, payloadStr, convReqId, ac.signal)
-    if (upstream.status === 401 && a.refreshToken) {
-      appendLog({ ts: new Date().toISOString(), event: 'token_401_retry', uid: a.uid })
-      await this.refreshForce(a)
-      a = loadAuth()
-      upstream = await this.send(a, payloadStr, convReqId, ac.signal)
-    }
+    const upstream = await this.openAuthorized(payloadStr, ac.signal)
 
     const isSse = (upstream.headers.get('content-type') ?? '').includes('event-stream')
     if (isSse) {
@@ -625,10 +986,10 @@ class DirectClient {
     if (aborted) res.destroy()
   }
 
-  send(a, payloadStr, convReqId, signal) {
-    return fetch(`${realm().chatBase}/v2/chat/completions`, {
+  send(a, payloadStr, convReqId, signal, r = realm()) {
+    return fetch(`${r.chatBase}/v2/chat/completions`, {
       method: 'POST',
-      headers: chatHeaders(a, convReqId),
+      headers: chatHeaders(a, convReqId, r),
       body: payloadStr,
       signal,
     })
@@ -710,13 +1071,16 @@ class DirectClient {
 // WorkBuddy desktop app, which attaches the Bearer token itself.
 // ---------------------------------------------------------------------------
 
-function wbipcEndpointFile() {
-  // Each desktop build keeps its own config dir; the international client writes
-  // to ~/.workbuddy-ai, so guessing one path loses the other realm's app.
-  const dir = process.env.WORKBUDDY_CONFIG_DIR
+// Each desktop build keeps its own config dir; the international client writes
+// to ~/.workbuddy-ai, so guessing one path loses the other realm's app.
+function wbipcPinned() { return Boolean(process.env.WORKBUDDY_CONFIG_DIR || process.env.CODEBUDDY_CONFIG_DIR) }
+function wbipcConfigDir() {
+  return process.env.WORKBUDDY_CONFIG_DIR
     || process.env.CODEBUDDY_CONFIG_DIR
     || path.join(os.homedir(), realm().configDir)
-  return path.join(dir, 'wbipc', 'endpoint.json')
+}
+function wbipcEndpointFile() {
+  return path.join(wbipcConfigDir(), 'wbipc', 'endpoint.json')
 }
 
 function readEndpoint() {
@@ -955,12 +1319,27 @@ function foldSseToCompletion(chunks, usage, model) {
     if (!ch) continue
     if (ch.delta?.content) contentParts.push(ch.delta.content)
     if (ch.delta?.reasoning_content) reasoningParts.push(ch.delta.reasoning_content)
-    if (ch.delta?.tool_calls) toolCalls.push(...ch.delta.tool_calls)
+    if (ch.delta?.tool_calls) {
+      // Streaming delivers a call's arguments in fragments keyed by index;
+      // collecting the deltas verbatim would emit several truncated calls.
+      for (const d of ch.delta.tool_calls) {
+        const key = Number.isInteger(d.index) ? d.index : 0
+        let t = toolCalls.find((x) => x.slot === key)
+        if (!t) {
+          t = { slot: key, id: undefined, type: 'function', function: { name: '', arguments: '' } }
+          toolCalls.push(t)
+        }
+        if (d.id) t.id = d.id
+        if (d.type) t.type = d.type
+        if (typeof d.function?.name === 'string') t.function.name += d.function.name
+        if (typeof d.function?.arguments === 'string') t.function.arguments += d.function.arguments
+      }
+    }
     if (ch.finish_reason) finishReason = ch.finish_reason
   }
   const message = { role: 'assistant', content: contentParts.join('') }
   if (reasoningParts.length) message.reasoning_content = reasoningParts.join('')
-  if (toolCalls.length) message.tool_calls = toolCalls
+  if (toolCalls.length) message.tool_calls = toolCalls.map(({ slot, ...rest }) => rest)
   return {
     id: id ?? 'chatcmpl-proxy',
     object: 'chat.completion',
@@ -1235,6 +1614,15 @@ async function webHandler(req, res) {
       sendJson(res, 200, { ok: true, mode, warnings })
       return
     }
+    if (req.method === 'POST' && sub === '/realm') {
+      const body = await readRequestBody(req)
+      const next = String(body.realm ?? '')
+      if (next !== 'cn' && next !== 'global') { sendJson(res, 400, { error: { message: 'realm must be cn or global' } }); return }
+      const switched = await switchRealmGuarded(next)
+      if (!switched.ok) { sendJson(res, 409, { error: { message: switched.error }, realm: CONFIG.realm }); return }
+      sendJson(res, 200, { ok: true, realm: switched.realm, mode: CONFIG.mode, warnings: switched.warnings, provider: switched.provider })
+      return
+    }
     if (req.method === 'POST' && sub === '/accounts/switch') {
       const body = await readRequestBody(req)
       const a = switchAuth(String(body.uid ?? ''))
@@ -1315,10 +1703,11 @@ export function apply(ctx) {
   // node_modules).
   registerTools(ctx).catch(() => { /* tools are optional */ })
 
-  // refresh the model catalog / promotions hourly and on startup
-  const catalogTimer = setInterval(() => { fetchCatalog().catch(() => {}) }, 3600_000)
+  // refresh the model catalog, the account whitelist and the DSH provider
+  // declaration hourly and on startup
+  const catalogTimer = setInterval(() => { refreshProvider().catch(() => {}) }, 3600_000)
   catalogTimer.unref?.()
-  fetchCatalog().catch(() => {})
+  refreshProvider().catch(() => {})
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -1358,7 +1747,7 @@ export function apply(ctx) {
         res.writeHead(200, { 'content-type': 'application/json' })
         let wbipcOk = false
         try { readEndpoint(); wbipcOk = true } catch { /* desktop app not running */ }
-        res.end(JSON.stringify({ plugin: name, ok: true, mode: CONFIG.mode, realm: CONFIG.realm, workbuddyIpc: wbipcOk, tool: toolStatus }))
+        res.end(JSON.stringify({ plugin: name, ok: true, mode: CONFIG.mode, realm: CONFIG.realm, workbuddyIpc: wbipcOk, ipcConfigDir: wbipcConfigDir(), ipcPinned: wbipcPinned(), tool: toolStatus, provider: providerSync, catalogFetchedAt: catalog.fetchedAt, pickerSize: catalog.picker.length }))
         return
       }
 
@@ -1450,6 +1839,7 @@ export function apply(ctx) {
         saveAuth(a)
         pendingLogin = null
         appendLog({ ts: new Date().toISOString(), event: 'login', uid: a.uid, nickname: a.nickname })
+        refreshProvider().catch(() => {}) // a fresh account may see a different whitelist
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ status: 'ok', uid: a.uid, nickname: a.nickname, expiresAt: a.expiresAt }))
         return
@@ -1502,6 +1892,26 @@ export function apply(ctx) {
         return
       }
 
+      if (req.method === 'POST' && url === '/config/realm') {
+        const body = await readBody(req)
+        let next = ''
+        try { next = String(JSON.parse(body.toString('utf8')).realm ?? '') } catch { /* invalid */ }
+        if (next !== 'cn' && next !== 'global') {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: { message: 'realm must be "cn" or "global"' } }))
+          return
+        }
+        const switched = await switchRealmGuarded(next)
+        if (!switched.ok) {
+          res.writeHead(409, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: { message: switched.error }, realm: CONFIG.realm }))
+          return
+        }
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, realm: switched.realm, mode: CONFIG.mode, warnings: switched.warnings, provider: switched.provider }))
+        return
+      }
+
       if (req.method === 'GET' && url === '/login/page') {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
         res.end(LOGIN_PAGE_HTML)
@@ -1512,7 +1922,7 @@ export function apply(ctx) {
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({
           object: 'list',
-          data: CONFIG.models.map((id) => ({ id, object: 'model', owned_by: 'workbuddy' })),
+          data: exposedModels().map((m) => ({ id: m.id, object: 'model', owned_by: 'workbuddy' })),
         }))
         return
       }
@@ -1537,6 +1947,20 @@ export function apply(ctx) {
         prefixTail: prefixHashes(body.messages ?? []).slice(-4),
       }
       const t0 = Date.now()
+
+      // An id we do not know has no price estimate, so forwarding it would slip
+      // past perRequestCreditBudget — and router tiers are hidden on purpose.
+      if (catalog.picker.length && !catalog.picker.includes(body.model)) {
+        appendLog({ ts: new Date().toISOString(), event: 'unknown_model', model: body.model, realm: CONFIG.realm })
+        res.writeHead(400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({
+          error: {
+            message: `unknown model ${JSON.stringify(body.model ?? null)} for realm ${CONFIG.realm}`,
+            hint: `this realm currently serves ${catalog.picker.length} models; see GET /v1/models`,
+          },
+        }))
+        return
+      }
 
       if (budgetBlocked()) {
         appendLog({ ts: new Date().toISOString(), event: 'budget_blocked', model: body.model, spendToday: spend.credits })
@@ -1576,7 +2000,17 @@ export function apply(ctx) {
       if (CONFIG.mode === 'direct') {
         const upstreamBody = { ...body, stream: true, stream_options: { include_usage: true } }
         try {
-          await direct.chat(JSON.stringify(upstreamBody), res, req, logCtx)
+          if (body.stream === true) {
+            await direct.chat(JSON.stringify(upstreamBody), res, req, logCtx)
+          } else {
+            const r = await direct.chatCollected(JSON.stringify(upstreamBody), req, logCtx)
+            if (!res.headersSent) {
+              res.writeHead(r.status, { 'content-type': 'application/json' })
+              res.end(r.status === 200 && r.isSse
+                ? JSON.stringify(foldSseToCompletion(r.chunks, r.usage, r.model))
+                : r.text)
+            }
+          }
         } catch (e) {
           if (!res.headersSent) {
             const status = e?.needsLogin ? 503 : 502
