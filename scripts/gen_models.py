@@ -7,12 +7,18 @@ Display names carry the CURRENT effective price (Asia/Shanghai), e.g.
   GLM-5.2 (x0.79·夜间23:00-7:50半价x0.40)
   Hy3 (现免费·至11-01)
 
-Usage: python scripts/gen_models.py <path-to-auth.json>
+Usage: python scripts/gen_models.py <path-to-auth.json> [realm]
+  realm: cn (default) | global — picks the catalog base and the provider
+  displayName written into the patches (international reads
+  www.workbuddy.ai/v3/config; its modelPromotions list stays empty, a
+  limited-time-free model shows up as credits "x0.00" instead).
 """
 import json, io, sys, re, urllib.request, datetime
 
 AUTH = json.load(io.open(sys.argv[1], encoding='utf-8'))
-BASE = 'https://copilot.tencent.com'
+REALM = sys.argv[2] if len(sys.argv) > 2 else 'cn'
+BASE = 'https://www.workbuddy.ai' if REALM == 'global' else 'https://copilot.tencent.com'
+DISPLAY_NAME = 'WorkBuddy 国际版 (预积分计费)' if REALM == 'global' else 'WorkBuddy (预积分计费)'
 
 def fetch(ua):
     req = urllib.request.Request(BASE + '/v3/config', headers={
@@ -20,7 +26,7 @@ def fetch(ua):
         'x-requested-with': 'XMLHttpRequest',
         'authorization': 'Bearer ' + AUTH['accessToken'],
         'x-user-id': AUTH.get('uid', ''),
-        'x-domain': 'copilot.tencent.com',
+        'x-domain': BASE.split('//')[1],
         'x-product': 'SaaS',
         'user-agent': ua,
         'x-codebuddy-request': '1',
@@ -31,10 +37,22 @@ def fetch(ua):
 ide = fetch('CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0')
 cli = fetch('CLI/2.137.1 CodeBuddy/2.137.1')
 
-# models currently listed by the official desktop picker (2026-10-07)
-ACTIVE = ['hy4-preview', 'hy3', 'space-bunny', 'deepseek-v4.1-flash', 'glm-5.3',
-          'glm-5.3-flash', 'glm-5.2', 'glm-5.1', 'glm-5v-turbo', 'minimax-m3',
-          'kimi-k3-1', 'kimi-k2.8-preview', 'kimi-k2.7', 'kimi-k2.6', 'deepseek-v4-pro']
+CTX_CAP = 1_000_000 if REALM == 'global' else 400_000
+
+if REALM == 'global':
+    # The international picker ships a different lineup than CN (GPT-5.6 family,
+    # GPT-6, Gemini-3.5; no v4-pro/minimax/space-bunny). Derive the list from the
+    # CLI-UA catalog: drop the Auto/Fast/Balanced/Primary/Deep tier aliases
+    # (*-model) and anything without a billable credit rate or a real context.
+    ACTIVE = [m['id'] for m in cli['data'].get('models', [])
+              if re.search(r'x[\d.]+', m.get('credits') or '')
+              and int(m.get('maxInputTokens') or 0) > 0
+              and not m['id'].endswith('-model')]
+else:
+    # models currently listed by the official CN desktop picker (2026-10-07)
+    ACTIVE = ['hy4-preview', 'hy3', 'space-bunny', 'deepseek-v4.1-flash', 'glm-5.3',
+              'glm-5.3-flash', 'glm-5.2', 'glm-5.1', 'glm-5v-turbo', 'minimax-m3',
+              'kimi-k3-1', 'kimi-k2.8-preview', 'kimi-k2.7', 'kimi-k2.6', 'deepseek-v4-pro']
 
 by_id = {}
 for m in ide['data'].get('models', []) + cli['data'].get('models', []):
@@ -83,6 +101,10 @@ def until_tag(p):
 
 def price_tag(mid, base):
     """Current-effective-price name suffix for this model."""
+    if REALM == 'global' and base == 0:
+        # International catalogs carry no modelPromotions; a limited-time-free
+        # model simply reports credits "x0.00".
+        return '现免费'
     dsh = now_sh()
     best = None
     for p in promos.get(mid, []):
@@ -129,7 +151,7 @@ for mid in ACTIVE:
     base = float(base.group(1)) if base else None
     tag = price_tag(mid, base) if base is not None else ''
     disp = f"{m.get('name') or mid} ({tag})" if tag else (m.get('name') or mid)
-    ctx = min(int(m.get('maxInputTokens') or 200000), 400000)
+    ctx = min(int(m.get('maxInputTokens') or 200000), CTX_CAP)
     out = min(int(m.get('maxOutputTokens') or 32000), 131072)
     inp = '["text", "image"]' if m.get('supportsImages') else '["text"]'
     lines.append(f"""          - id: {mid}
@@ -156,7 +178,7 @@ def models_objs():
             'id': mid,
             'name': disp,
             'input': (['text', 'image'] if m.get('supportsImages') else ['text']),
-            'contextWindow': min(int(m.get('maxInputTokens') or 200000), 400000),
+            'contextWindow': min(int(m.get('maxInputTokens') or 200000), CTX_CAP),
             'maxTokens': min(int(m.get('maxOutputTokens') or 32000), 131072),
         })
     return out
@@ -171,6 +193,7 @@ doc = yaml.safe_load(io.open(repo, encoding='utf-8'))
 for entry in doc:
     if entry.get('id') == 'llm-pi-ai':
         entry['config']['providers']['workbuddy']['models'] = models_objs()
+        entry['config']['providers']['workbuddy']['displayName'] = DISPLAY_NAME
 write_yaml(repo, doc)
 
 # 2. user's live profile patch
@@ -179,6 +202,7 @@ doc = yaml.safe_load(io.open(p, encoding='utf-8'))
 for entry in doc:
     if entry.get('id') == 'llm-pi-ai':
         entry['config']['providers']['workbuddy']['models'] = models_objs()
+        entry['config']['providers']['workbuddy']['displayName'] = DISPLAY_NAME
 write_yaml(p, doc)
 
 # 3. index.js DEFAULTS.models

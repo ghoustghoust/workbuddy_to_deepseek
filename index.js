@@ -53,7 +53,7 @@ const DEFAULTS = {
   clientVersion: '5.5.4', // WorkBuddy desktop version segment for UA
   cliVersion: '2.137.1', // CLI version segment for UA
   models: [
-    'hy4-preview', 'hy3', 'space-bunny', 'deepseek-v4.1-flash', 'glm-5.3', 'glm-5.3-flash', 'glm-5.2', 'glm-5.1', 'glm-5v-turbo', 'minimax-m3', 'kimi-k3-1', 'kimi-k2.8-preview', 'kimi-k2.7', 'kimi-k2.6', 'deepseek-v4-pro'
+    'deepseek-v4.1-flash', 'deepseek-v4.1-flash-sg', 'gpt-6-astra', 'hy4-preview', 'hy3', 'kimi-k2.8-preview', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gemini-3.5-flash', 'glm-5.3-flash', 'glm-5.3', 'glm-5.2', 'kimi-k3', 'kimi-k2.6'
   ],
 }
 
@@ -92,6 +92,7 @@ const REALMS = {
     origin: 'https://www.codebuddy.cn',
     acceptLanguage: 'zh-CN',
     uaPlatform: 'WorkBuddy',
+    configDir: '.workbuddy',
   },
   global: {
     chatBase: 'https://www.workbuddy.ai',
@@ -99,6 +100,7 @@ const REALMS = {
     origin: 'https://www.workbuddy.ai',
     acceptLanguage: 'en-US',
     uaPlatform: 'WorkBuddy AI',
+    configDir: '.workbuddy-ai',
   },
 }
 
@@ -556,11 +558,29 @@ class DirectClient {
     const usage = { prompt: null, cacheHit: 0, cacheMiss: 0, credit: 0 }
     const decoder = new TextDecoder()
     let lineBuf = ''
+    let bytes = 0
+    const model = JSON.parse(payloadStr).model
     const reader = upstream.body.getReader()
+    let aborted = null
+    // Upstream stall guard: DSH's stream-idle watchdog (300s, provider-tunable)
+    // aborts from the client side, but if DSH is configured loose or the client
+    // walks away mid-stream, nothing else would cut a dead upstream. 600s of
+    // zero bytes is far beyond any observed prefill (worst measured: 243s).
+    const UPSTREAM_IDLE_MS = 600000
+    let lastByteAt = Date.now()
+    let firstByteMs = null
+    const guard = setInterval(() => {
+      if (Date.now() - lastByteAt >= UPSTREAM_IDLE_MS) {
+        ac.abort(new Error(`upstream idle ${UPSTREAM_IDLE_MS}ms`))
+      }
+    }, 15000)
     try {
       for (;;) {
         const { done, value } = await reader.read()
         if (done) break
+        if (firstByteMs === null) firstByteMs = Date.now() - t0
+        lastByteAt = Date.now()
+        bytes += value?.byteLength ?? 0
         if (isSse) {
           lineBuf += decoder.decode(value, { stream: true })
           let idx
@@ -583,19 +603,26 @@ class DirectClient {
         if (!res.writableEnded) res.write(Buffer.from(value))
       }
       res.end()
+    } catch (err) {
+      // DSH's stream idle watchdog closes the connection mid-stream; the request
+      // still has to reach the ledger below or spend goes uncounted.
+      aborted = err?.message ?? String(err)
     } finally {
+      clearInterval(guard)
       try { reader.releaseLock() } catch { /* stream already released */ }
+      addSpend(usage.credit)
+      markFreeExhaustedIfNeeded(model, usage.credit)
+      appendLog({
+        ts: new Date().toISOString(), event: 'request', mode: 'direct', ...logCtx,
+        status: upstream.status, model, durationMs: Date.now() - t0, sseBytes: bytes,
+        firstByteMs, aborted,
+        usage: usage.prompt !== null ? {
+          prompt_tokens: usage.prompt, prompt_cache_hit_tokens: usage.cacheHit,
+          prompt_cache_miss_tokens: usage.cacheMiss, credit: usage.credit,
+        } : null,
+      })
     }
-    addSpend(usage.credit)
-    markFreeExhaustedIfNeeded(JSON.parse(payloadStr).model, usage.credit)
-    appendLog({
-      ts: new Date().toISOString(), event: 'request', mode: 'direct', ...logCtx,
-      status: upstream.status, model: JSON.parse(payloadStr).model, durationMs: Date.now() - t0,
-      usage: usage.prompt !== null ? {
-        prompt_tokens: usage.prompt, prompt_cache_hit_tokens: usage.cacheHit,
-        prompt_cache_miss_tokens: usage.cacheMiss, credit: usage.credit,
-      } : null,
-    })
+    if (aborted) res.destroy()
   }
 
   send(a, payloadStr, convReqId, signal) {
@@ -608,23 +635,58 @@ class DirectClient {
   }
 
   async balance() {
-    const a = await this.ensureToken()
     const r = realm()
+    // Identity follows the transport: wbipc lets the desktop app sign the query
+    // (its account is the one actually being charged); direct uses the stored
+    // account's own token. Endpoint and response shape differ per realm: CN
+    // reads get-user-resource (Accounts), international reads
+    // get-user-resource-summary (Packages, carrying the remain/total directly).
+    const post = async (p, body) => {
+      if (CONFIG.mode === 'wbipc') {
+        const res = await wbipc.httpFetch({
+          method: 'POST', path: p,
+          headers: { accept: 'application/json', 'content-type': 'application/json' },
+          body: Buffer.from(JSON.stringify(body)),
+        })
+        const text = res.body.toString('utf8')
+        if (res.status !== 200) throw new Error(`billing ${p} -> HTTP ${res.status}: ${text.slice(0, 200)}`)
+        let parsed
+        try { parsed = JSON.parse(text) } catch { throw new Error(`billing ${p}: non-JSON response: ${text.slice(0, 200)}`) }
+        if (parsed == null) throw new Error(`billing ${p}: null body (HTTP ${res.status}): ${text.slice(0, 200)}`)
+        return parsed
+      }
+      const a = await this.ensureToken()
+      const res = await fetch(`${r.billingBase}${p}`, {
+        method: 'POST',
+        headers: billingHeaders(a),
+        body: JSON.stringify(body),
+      })
+      return res.json().catch(() => null)
+    }
+    if (r === REALMS.global) {
+      const env = await post('/billing/meter/get-user-resource-summary', {})
+      if (env?.code !== 0) throw new Error(`billing summary failed: code=${env?.code ?? '?'} msg=${env?.msg ?? JSON.stringify(env).slice(0, 200)}`)
+      const pkgs = env?.data?.Packages ?? []
+      let remain = 0
+      let total = 0
+      for (const p of pkgs) {
+        const left = Number(p.CycleRemainCapacity) || 0
+        const size = Number(p.CycleTotalCapacity) || 0
+        remain += Math.max(0, left)
+        total += Math.max(size, left)
+      }
+      return { remain, total, packages: pkgs.length, subscription: env?.data?.SubscriptionPackageName ?? '' }
+    }
     const layout = (d) => {
       const p = (n) => String(n).padStart(2, '0')
       return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
     }
     const end = new Date(Date.now() + 365 * 101 * 86400_000)
-    const res = await fetch(`${r.billingBase}/v2/billing/meter/get-user-resource`, {
-      method: 'POST',
-      headers: billingHeaders(a),
-      body: JSON.stringify({
-        PageNumber: 1, PageSize: 100, ProductCode: 'p_tcaca', Status: [0, 3],
-        PackageEndTimeRangeBegin: layout(new Date()),
-        PackageEndTimeRangeEnd: layout(end),
-      }),
+    const env = await post('/v2/billing/meter/get-user-resource', {
+      PageNumber: 1, PageSize: 100, ProductCode: 'p_tcaca', Status: [0, 3],
+      PackageEndTimeRangeBegin: layout(new Date()),
+      PackageEndTimeRangeEnd: layout(end),
     })
-    const env = await res.json().catch(() => null)
     const accounts = env?.Response?.Data?.Accounts
       ?? env?.response?.data?.accounts
       ?? env?.data?.Response?.Data?.Accounts
@@ -649,9 +711,11 @@ class DirectClient {
 // ---------------------------------------------------------------------------
 
 function wbipcEndpointFile() {
+  // Each desktop build keeps its own config dir; the international client writes
+  // to ~/.workbuddy-ai, so guessing one path loses the other realm's app.
   const dir = process.env.WORKBUDDY_CONFIG_DIR
     || process.env.CODEBUDDY_CONFIG_DIR
-    || path.join(os.homedir(), '.workbuddy')
+    || path.join(os.homedir(), realm().configDir)
   return path.join(dir, 'wbipc', 'endpoint.json')
 }
 
@@ -831,6 +895,10 @@ class WbipcClient {
     return { status: res.status, headers: res.headers, body: Buffer.from(res.body_b64, 'base64') }
   }
 }
+
+// Module-level singleton: both the chat forwarder and DirectClient.balance()
+// need the same pipe connection.
+const wbipc = new WbipcClient()
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -1093,7 +1161,12 @@ function webSummary() {
     port: CONFIG.port,
     workbuddyIpc: wbipcOk,
     tool: toolStatus,
-    account: a ? { uid: a.uid, nickname: a.nickname, expiresAt: a.expiresAt } : null,
+    // In wbipc mode the spending identity is the desktop app's account (the
+    // stored direct-mode account is not who gets billed), so say so instead of
+    // parading the stored nickname.
+    account: CONFIG.mode === 'wbipc'
+      ? { uid: '', nickname: `桌面端 (${CONFIG.realm === 'global' ? '国际版' : '国内版'})`, expiresAt: 0, via: 'wbipc' }
+      : a ? { uid: a.uid, nickname: a.nickname, expiresAt: a.expiresAt } : null,
     accounts: listAuths(),
     spendToday: Math.round((spend.credits ?? 0) * 1000) / 1000,
     dailyCreditBudget: CONFIG.dailyCreditBudget,
@@ -1235,8 +1308,6 @@ function readRequestBody(req) {
 export function apply(ctx) {
   cleanOldLogs()
   loadSpend()
-
-  const wbipc = new WbipcClient()
 
   // DSH tool integration: lets the agent answer "切换账号 / 查余额" in chat.
   // Registered only when the dsh-tools package is resolvable (always true for
